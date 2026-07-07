@@ -1,0 +1,6 @@
+name: astrbot_plugin_qqofficial_full
+display_name: QQ Official Full Adapter
+desc: Full QQ Official platform adapters for AstrBot using QQ Open Platform REST, WebSocket gateway, and Webhook APIs.
+version: v0.1.0
+author: OpenCode
+repo: ""

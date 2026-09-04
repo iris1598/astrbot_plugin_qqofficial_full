@@ -7,7 +7,6 @@ import inspect
 import ipaddress
 import json
 import os
-import random
 import re
 import socket
 import threading
@@ -109,6 +108,20 @@ WEBHOOK_MAX_BODY_BYTES = 1_048_576
 WEBHOOK_RATE_WINDOW_SECONDS = 60.0
 WEBHOOK_RATE_MAX_REQUESTS = 600
 WEBHOOK_RATE_MAX_KEYS = 4096
+
+# 官方文档:单聊被动回复 60 分钟/4 次;群聊 5 分钟/5 次
+PASSIVE_REPLY_RULES = {
+    "c2c": {"limit": 4, "ttl_seconds": 3600.0},
+    "group": {"limit": 5, "ttl_seconds": 300.0},
+}
+# token 失效类错误码(HTTP 401 或业务码)→ 清 token 重试一次
+AUTH_INVALID_BIZ_CODES = frozenset(
+    {11001, 11002, 11201, 11202, 11203, 11204, 11205, 11206, 11207, 11208}
+)
+# 被动回复 msg_id 失效/超限/被去重 → 降级主动消息重发
+PASSIVE_INVALID_BIZ_CODES = frozenset({40034024, 40034026, 40034128, 40054005})
+# 服务端瞬态错误/频控 → 短退避重试
+TRANSIENT_BIZ_CODES = frozenset({50055001, 50055002, 40034100})
 
 
 class QQOfficialAPIError(Exception):
@@ -947,6 +960,20 @@ class QQStreamingController:
         self.sent_chunk_count = 0
         self._stream_msg_id: str | None = None
         self._index = 0
+        self._msg_seq = 0
+
+    def _next_seq(self) -> int:
+        """Return a monotonically increasing msg_seq for this stream session.
+
+        QQ replaces stream content in-place and drops any chunk whose
+        ``msg_seq`` is not greater than the last accepted one, so a random
+        sequence silently truncates the message.
+
+        Returns:
+            Next sequence number, cycling within 1..65535.
+        """
+        self._msg_seq = self._msg_seq % 65535 + 1
+        return self._msg_seq
 
     @property
     def is_terminal(self) -> bool:
@@ -1048,22 +1075,35 @@ class QQStreamingController:
             "content_raw": text,
             "event_id": self.event_message_id,
             "msg_id": self.event_message_id,
-            "msg_seq": random.randint(1, 65535),
+            "msg_seq": 0,
             "index": self._index,
         }
         if self._stream_msg_id:
             payload["stream_msg_id"] = self._stream_msg_id
-        try:
-            ret = await self.client.send_stream_message(self.openid, payload)
-        except Exception as exc:
-            logger.error(
-                "[QQOfficialFull] stream update failed (len=%d): %s",
-                len(text),
-                exc,
-            )
-            self.session_open = False
-            self._transition("failed", "update_error")
-            return
+        ret: dict | None = None
+        for attempt in (1, 2):
+            payload["msg_seq"] = self._next_seq()
+            try:
+                ret = await self.client.send_stream_message(self.openid, payload)
+                break
+            except Exception as exc:
+                if attempt == 1:
+                    logger.warning(
+                        "[QQOfficialFull] stream update failed (len=%d), "
+                        "retrying once: %s",
+                        len(text),
+                        exc,
+                    )
+                    await asyncio.sleep(0.3)
+                    continue
+                logger.error(
+                    "[QQOfficialFull] stream update failed after retry (len=%d): %s",
+                    len(text),
+                    exc,
+                )
+                self.session_open = False
+                self._transition("failed", "update_error")
+                return
         self._stream_msg_id = (
             ret.get("id") or ret.get("stream_msg_id") or self._stream_msg_id
         )
@@ -1081,7 +1121,7 @@ class QQStreamingController:
             "content_raw": self.last_accepted_full or "\n",
             "event_id": self.event_message_id,
             "msg_id": self.event_message_id,
-            "msg_seq": random.randint(1, 65535),
+            "msg_seq": self._next_seq(),
             "index": self._index,
         }
         if self._stream_msg_id:
@@ -1230,44 +1270,85 @@ class QQOfficialClient:
         Raises:
             QQOfficialAPIError: On HTTP, network, or JSON failures.
         """
-        request_headers = dict(headers or {})
-        if auth:
-            request_headers["Authorization"] = f"QQBot {await self.get_access_token()}"
-        request_headers.setdefault("Content-Type", "application/json")
         url = (
             path
             if path.startswith(("http://", "https://"))
             else f"{self.api_base_url}{path}"
         )
-        try:
-            response = await self._http.request(
-                method,
-                url,
-                json=json_data,
-                params=query_params,
-                headers=request_headers,
-                timeout=timeout or self.timeout,
-            )
-        except Exception as exc:
-            raise QQOfficialAPIError(method, path, 0, str(exc)) from exc
-        text = response.text
-        if response.status_code >= 400:
+        for attempt in (1, 2):
+            request_headers = dict(headers or {})
+            if auth:
+                request_headers["Authorization"] = (
+                    f"QQBot {await self.get_access_token()}"
+                )
+            request_headers.setdefault("Content-Type", "application/json")
             try:
-                data = response.json()
-                message = data.get("message") or data.get("error") or text
-                biz_code = data.get("code") or data.get("err_code")
-            except ValueError:
-                message = text
-                biz_code = None
-            raise QQOfficialAPIError(
-                method, path, response.status_code, message, biz_code
-            )
-        if not text:
-            return {}
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise QQOfficialAPIError(method, path, response.status_code, text) from exc
+                response = await self._http.request(
+                    method,
+                    url,
+                    json=json_data,
+                    params=query_params,
+                    headers=request_headers,
+                    timeout=timeout or self.timeout,
+                )
+            except Exception as exc:
+                raise QQOfficialAPIError(method, path, 0, str(exc)) from exc
+            text = response.text
+            if response.status_code >= 400:
+                try:
+                    data = response.json()
+                    message = data.get("message") or data.get("error") or text
+                    biz_code = data.get("code") or data.get("err_code")
+                except ValueError:
+                    message = text
+                    biz_code = None
+                try:
+                    biz_code_int = int(biz_code) if biz_code is not None else 0
+                except (TypeError, ValueError):
+                    biz_code_int = 0
+                if (
+                    auth
+                    and attempt == 1
+                    and (
+                        response.status_code == 401
+                        or biz_code_int in AUTH_INVALID_BIZ_CODES
+                    )
+                ):
+                    logger.info(
+                        "[QQOfficialFull] access token rejected (%s), "
+                        "refreshing and retrying",
+                        biz_code_int or response.status_code,
+                    )
+                    self.clear_token()
+                    continue
+                if attempt == 1 and response.status_code == 429:
+                    retry_after = 2.0
+                    try:
+                        retry_after = min(
+                            10.0, max(1.0, float(response.headers.get("Retry-After")))
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    logger.warning(
+                        "[QQOfficialFull] rate limited on %s %s, retrying in %.1fs",
+                        method,
+                        path,
+                        retry_after,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                raise QQOfficialAPIError(
+                    method, path, response.status_code, message, biz_code
+                )
+            if not text:
+                return {}
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise QQOfficialAPIError(
+                    method, path, response.status_code, text
+                ) from exc
+        raise QQOfficialAPIError(method, path, 401, "authorization failed after retry")
 
     async def get_gateway(self) -> str:
         """Fetch the QQ WebSocket gateway URL.
@@ -1762,7 +1843,9 @@ class QQOfficialFullMessageEvent(AstrMessageEvent):
         )
         if scene != "c2c":
             return
-        await self.adapter._send_c2c_input_notify(self.session_id)
+        await self.adapter._send_c2c_input_notify(
+            self.session_id, self.message_obj.message_id
+        )
 
     async def send_streaming(
         self,
@@ -1919,8 +2002,12 @@ class QQOfficialFullPlatformAdapter(Platform):
             ),
         )
         self._sessions: dict[str, dict[str, Any]] = {}
-        self._reply_limiter = ReplyLimiter()
+        self._reply_limiters: dict[str, ReplyLimiter] = {
+            scene: ReplyLimiter(limit=rule["limit"], ttl_seconds=rule["ttl_seconds"])
+            for scene, rule in PASSIVE_REPLY_RULES.items()
+        }
         self._msg_id_cache = MsgIdCache()
+        self._msg_seq_counters: dict[str, tuple[int, float]] = {}
         self._session_store_path = self._resolve_session_store_path(platform_config)
         self._ref_index = PersistedRefIndexStore(
             self._session_store_path.with_name("qqofficial_full_ref_index.jsonl")
@@ -1930,6 +2017,8 @@ class QQOfficialFullPlatformAdapter(Platform):
         self._last_seq: int | None = None
         self._gateway_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._hb_pending: float | None = None
+        self._ready_received = False
         self._shutdown_event = asyncio.Event()
         self._pending_event_extras: dict[str, dict[str, Any]] = {}
         self._typing_tasks: set[asyncio.Task] = set()
@@ -2110,14 +2199,13 @@ class QQOfficialFullPlatformAdapter(Platform):
         if not text and not media and not raw_payload:
             return
 
+        limiter = self._reply_limiters.get(scene) or self._reply_limiters["c2c"]
         passive_degraded = False
         passive_msg_id = reply_id or reply_message_id
         if from_event and scene in {"group", "c2c"} and passive_msg_id:
-            allowed, _remaining, reason = self._reply_limiter.check_limit(
-                passive_msg_id
-            )
+            allowed, _remaining, reason = limiter.check_limit(passive_msg_id)
             if allowed:
-                self._reply_limiter.record(passive_msg_id)
+                limiter.record(passive_msg_id)
             else:
                 logger.info(
                     "[QQOfficialFull] Passive reply limit hit (%s) for %s, "
@@ -2141,15 +2229,12 @@ class QQOfficialFullPlatformAdapter(Platform):
         if passive_degraded:
             payload.pop("msg_id", None)
             payload.pop("message_reference", None)
-        cached_passive_id: str | None = None
         if not from_event and scene in {"group", "c2c"} and not reply_id:
             cached_passive_id = self._msg_id_cache.get(scene, target_id)
             if cached_passive_id:
-                allowed, _remaining, _reason = self._reply_limiter.check_limit(
-                    cached_passive_id
-                )
+                allowed, _remaining, _reason = limiter.check_limit(cached_passive_id)
                 if allowed:
-                    self._reply_limiter.record(cached_passive_id)
+                    limiter.record(cached_passive_id)
                     payload["msg_id"] = cached_passive_id
                 else:
                     cached_passive_id = None
@@ -2222,11 +2307,24 @@ class QQOfficialFullPlatformAdapter(Platform):
             payload.update({"content": text, "msg_type": 0})
 
         if scene in {"group", "c2c"}:
-            payload.setdefault("msg_seq", random.randint(1, 65535))
+            target_key = f"{scene}:{session_info.get('target_id') or ''}"
+            payload.setdefault("msg_seq", self._next_msg_seq(target_key))
         if reply_id and (from_event or scene in {"channel", "dm"}):
             payload.setdefault("msg_id", reply_id)
-        if reply_id:
+        if reply_id and scene not in {"group", "c2c"}:
             payload.setdefault("message_reference", {"message_id": reply_id})
+        elif scene in {"group", "c2c"}:
+            quote_key = ""
+            if str(reply_id or "").startswith("REFIDX_"):
+                quote_key = str(reply_id)
+            elif (
+                from_event
+                and str(session_info.get("quote_ref") or "").startswith("REFIDX_")
+                and session_info.get("message_id") == reply_id
+            ):
+                quote_key = str(session_info["quote_ref"])
+            if quote_key:
+                payload.setdefault("message_reference", {"message_id": quote_key})
         if keyboard:
             payload["keyboard"] = keyboard
         if not from_event and scene in {"group", "c2c"}:
@@ -2238,7 +2336,11 @@ class QQOfficialFullPlatformAdapter(Platform):
     async def _send_payload_with_fallback(
         self, scene: str, target_id: str, payload: dict, plain_text: str
     ) -> dict:
-        """Send payload and retry markdown rejections as plain text.
+        """Send payload with error-code driven retries and degradation.
+
+        Handles: markdown rejection -> plain; passive msg_id expired /
+        over-limit / deduped (40034024/26/128, 40054005) -> proactive
+        re-send; transient server errors and 429 -> bounded backoff retry.
 
         Args:
             scene: QQ scene name.
@@ -2249,17 +2351,51 @@ class QQOfficialFullPlatformAdapter(Platform):
         Returns:
             Message response dict.
         """
-        try:
-            return await self._send_payload(scene, target_id, payload)
-        except QQOfficialAPIError as exc:
-            if MARKDOWN_NOT_ALLOWED_ERROR not in str(exc) or "markdown" not in payload:
+        seq_key = f"{scene}:{target_id}"
+        for attempt in (1, 2, 3):
+            try:
+                return await self._send_payload(scene, target_id, payload)
+            except QQOfficialAPIError as exc:
+                try:
+                    biz = int(exc.biz_code) if exc.biz_code is not None else 0
+                except (TypeError, ValueError):
+                    biz = 0
+                if attempt < 3:
+                    if MARKDOWN_NOT_ALLOWED_ERROR in str(exc) and "markdown" in payload:
+                        retry = dict(payload)
+                        retry.pop("markdown", None)
+                        retry["content"] = plain_text
+                        if retry.get("msg_type") == 2:
+                            retry["msg_type"] = 0
+                        if "msg_seq" in retry:
+                            retry["msg_seq"] = self._next_msg_seq(seq_key)
+                        payload = retry
+                        continue
+                    if biz in PASSIVE_INVALID_BIZ_CODES and (
+                        "msg_id" in payload or "message_reference" in payload
+                    ):
+                        logger.info(
+                            "[QQOfficialFull] passive reply rejected "
+                            "(code=%s: %s), re-sending as proactive message",
+                            biz,
+                            exc.message,
+                        )
+                        retry = dict(payload)
+                        retry.pop("msg_id", None)
+                        retry.pop("message_reference", None)
+                        if "msg_seq" in retry:
+                            retry["msg_seq"] = self._next_msg_seq(seq_key)
+                        payload = retry
+                        continue
+                    if biz in TRANSIENT_BIZ_CODES or exc.status_code == 429:
+                        logger.warning(
+                            "[QQOfficialFull] transient send error (%s), retrying",
+                            exc.message,
+                        )
+                        await asyncio.sleep(1.0 * attempt)
+                        continue
                 raise
-            fallback = dict(payload)
-            fallback.pop("markdown", None)
-            fallback["content"] = plain_text
-            if fallback.get("msg_type") == 2:
-                fallback["msg_type"] = 0
-            return await self._send_payload(scene, target_id, fallback)
+        raise RuntimeError("unreachable send retry state")
 
     async def _send_payload(self, scene: str, target_id: str, payload: dict) -> dict:
         """Dispatch payload to the correct QQ send endpoint.
@@ -2521,8 +2657,46 @@ class QQOfficialFullPlatformAdapter(Platform):
         """
         return cast(str | None, self._sessions.get(session_id, {}).get("scene"))
 
+    def _next_msg_seq(self, key: str) -> int:
+        """Return a monotonically increasing msg_seq for a send target.
+
+        QQ requires msg_seq to increase across successive sends in the same
+        context; random values make the platform silently drop messages.
+        Fresh or long-idle keys re-seed from the wall clock so process
+        restarts continue above the previous sequence.
+
+        Args:
+            key: Scope-qualified target key.
+
+        Returns:
+            Next sequence number in 1..65535.
+        """
+        now = time.time()
+        last = self._msg_seq_counters.get(key)
+        if last is None or now - last[1] > 3600.0:
+            seq = int(now * 1000) % 65535 or 1
+        else:
+            seq = last[0] % 65535 + 1
+        self._msg_seq_counters[key] = (seq, now)
+        if len(self._msg_seq_counters) > 8192:
+            stale = [
+                name
+                for name, (_, seen) in self._msg_seq_counters.items()
+                if now - seen > 3600.0
+            ]
+            for name in stale:
+                del self._msg_seq_counters[name]
+        return seq
+
     def _store_ref_index(
-        self, ret: Any, content: str, scope: str, *, is_bot: bool = True
+        self,
+        ret: Any,
+        content: str,
+        scope: str,
+        *,
+        is_bot: bool = True,
+        sender_id: str = "",
+        sender_name: str = "",
     ) -> None:
         """Persist REFIDX key of an API response for quote lookups.
 
@@ -2531,6 +2705,8 @@ class QQOfficialFullPlatformAdapter(Platform):
             content: Display content of the referenced message.
             scope: QQ scene name.
             is_bot: Whether the entry was sent by this bot.
+            sender_id: Override sender id (inbound messages).
+            sender_name: Override sender name (inbound messages).
         """
         if not isinstance(ret, dict):
             return
@@ -2544,14 +2720,54 @@ class QQOfficialFullPlatformAdapter(Platform):
             {
                 "messageId": str(message_id),
                 "content": content or "",
-                "senderId": str(ext_info.get("sender_id") or self.appid),
-                "senderName": str(ext_info.get("sender_name") or self.appid),
+                "senderId": sender_id or str(ext_info.get("sender_id") or self.appid),
+                "senderName": sender_name
+                or str(ext_info.get("sender_name") or self.appid),
                 "timestamp": ret.get("timestamp")
                 or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "isBot": is_bot,
                 "scope": scope,
             },
         )
+
+    def _remember_inbound_ref(
+        self, payload: dict, abm: AstrBotMessage, scene: str, *, target_id: str
+    ) -> None:
+        """Register the inbound message's own REFIDX key for quote lookups.
+
+        Args:
+            payload: QQ event payload.
+            abm: Parsed AstrBot message.
+            scene: QQ scene name.
+            target_id: Session target id.
+        """
+        quote_ref = ""
+        for entry in payload.get("ext") or []:
+            if isinstance(entry, dict) and entry.get("msg_idx"):
+                quote_ref = str(entry["msg_idx"])
+                break
+        if not quote_ref:
+            return
+        self.remember_session(
+            target_id,
+            scene=scene,
+            target_id=target_id,
+            message_id=abm.message_id,
+            quote_ref=quote_ref,
+        )
+        if abm.message_str:
+            self._store_ref_index(
+                {
+                    "id": abm.message_id,
+                    "msg_idx": quote_ref,
+                    "timestamp": payload.get("timestamp"),
+                },
+                abm.message_str,
+                scene,
+                is_bot=False,
+                sender_id=abm.sender.user_id,
+                sender_name=abm.sender.nickname or "",
+            )
 
     @staticmethod
     def _media_label_for_chain(message_chain: MessageChain) -> str:
@@ -2728,6 +2944,8 @@ class QQOfficialFullPlatformAdapter(Platform):
             components.append(Plain(plain))
         await self._append_attachments(components, payload.get("attachments") or [])
         abm.message = components
+        if qq_scene in {"group", "c2c"}:
+            self._remember_inbound_ref(payload, abm, qq_scene, target_id=abm.session_id)
         if not getattr(abm, "self_id", ""):
             abm.self_id = "qq_official_full"
         self._pending_event_extras[abm.message_id] = {
@@ -2880,27 +3098,29 @@ class QQOfficialFullPlatformAdapter(Platform):
             return
         abm = await self._parse_message_event(event_type, payload, event_id)
         if event_type == "C2C_MESSAGE_CREATE":
-            task = asyncio.create_task(self._send_c2c_input_notify(abm.session_id))
+            task = asyncio.create_task(
+                self._send_c2c_input_notify(abm.session_id, abm.message_id)
+            )
             self._typing_tasks.add(task)
             task.add_done_callback(self._typing_tasks.discard)
         self.commit_event(self.create_event(abm))
 
-    async def _send_c2c_input_notify(self, openid: str) -> None:
+    async def _send_c2c_input_notify(self, openid: str, msg_id: str = "") -> None:
         """Send QQ C2C input notification, swallowing failures.
 
         Args:
             openid: C2C target openid.
+            msg_id: Passive reply message id (official docs require it).
         """
+        payload: dict[str, Any] = {
+            "msg_type": 6,
+            "input_notify": {"input_type": 1, "input_second": 60},
+            "msg_seq": self._next_msg_seq(f"c2c:{openid}"),
+        }
+        if msg_id:
+            payload["msg_id"] = msg_id
         try:
-            await self.client.send_v2_message(
-                "c2c",
-                openid,
-                {
-                    "msg_type": 6,
-                    "input_notify": {"input_type": 1, "input_second": 60},
-                    "msg_seq": random.randint(1, 65535),
-                },
-            )
+            await self.client.send_v2_message("c2c", openid, payload)
         except Exception as exc:
             logger.debug("[QQOfficialFull] typing notify failed: %s", exc)
 
@@ -3020,13 +3240,25 @@ class QQOfficialFullPlatformAdapter(Platform):
     async def _gateway_heartbeat(self, websocket: Any, interval_ms: int) -> None:
         """Send gateway heartbeats until cancelled.
 
+        Tracks the Heartbeat ACK (op 11). If two consecutive beats go
+        unacknowledged the connection is treated as a zombie and closed so
+        the outer loop reconnects — QQ silently drops half-open sockets.
+
         Args:
             websocket: WebSocket connection.
             interval_ms: Heartbeat interval from QQ Hello payload.
         """
+        ack_timeout = max(interval_ms / 1000 * 2.0, 5.0)
         try:
             while not self._shutdown_event.is_set():
                 await asyncio.sleep(interval_ms / 1000)
+                if self._hb_pending and time.time() - self._hb_pending > ack_timeout:
+                    logger.warning(
+                        "[QQOfficialFull] Heartbeat ACK timeout, forcing reconnect"
+                    )
+                    await websocket.close()
+                    return
+                self._hb_pending = time.time()
                 await websocket.send(
                     json.dumps({"op": OP_HEARTBEAT, "d": self._last_seq})
                 )
@@ -3039,13 +3271,16 @@ class QQOfficialFullPlatformAdapter(Platform):
         """Run one QQ gateway WebSocket connection."""
         gateway_url = self.gateway_url_override or await self.client.get_gateway()
         token = await self.client.get_access_token()
+        self._hb_pending = None
         async with websockets.connect(gateway_url) as websocket:
             async for raw_message in websocket:
                 payload = json.loads(raw_message)
                 op = payload.get("op")
                 if payload.get("s") is not None:
                     self._last_seq = int(payload["s"])
-                if op == OP_HELLO:
+                if op == OP_HEARTBEAT_ACK:
+                    self._hb_pending = None
+                elif op == OP_HELLO:
                     interval = int(
                         payload.get("d", {}).get("heartbeat_interval") or 45000
                     )
@@ -3060,7 +3295,9 @@ class QQOfficialFullPlatformAdapter(Platform):
                     data = payload.get("d") or {}
                     if event_type == "READY":
                         self._session_id = str(data.get("session_id") or "")
+                        self._ready_received = True
                     elif event_type == "RESUMED":
+                        self._ready_received = True
                         logger.info("[QQOfficialFull] Gateway session resumed.")
                     elif event_type:
                         await self._dispatch_payload_event(
@@ -3080,10 +3317,14 @@ class QQOfficialFullPlatformAdapter(Platform):
     async def run(self) -> None:
         """Run the QQ WebSocket gateway loop."""
         reconnect_delay = 1.0
+        quick_failures = 0
         while not self._shutdown_event.is_set():
+            attempt_started = time.time()
+            self._ready_received = False
             try:
                 await self._gateway_once()
                 reconnect_delay = 1.0
+                quick_failures = 0
             except asyncio.CancelledError:
                 raise
             except websockets.exceptions.ConnectionClosed as exc:
@@ -3097,6 +3338,9 @@ class QQOfficialFullPlatformAdapter(Platform):
                 )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60.0)
+                quick_failures = await self._note_attempt_outcome(
+                    quick_failures, attempt_started
+                )
             except Exception as exc:
                 logger.warning(
                     "[QQOfficialFull] Gateway error: %s, reconnecting in %.1fs",
@@ -3105,6 +3349,42 @@ class QQOfficialFullPlatformAdapter(Platform):
                 )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60.0)
+                quick_failures = await self._note_attempt_outcome(
+                    quick_failures, attempt_started
+                )
+
+    async def _note_attempt_outcome(
+        self, quick_failures: int, started_at: float
+    ) -> int:
+        """Guard against reconnect storms that exhaust QQ session_start_limit.
+
+        QQ allows about 1000 new sessions per 24h; retrying every few
+        seconds on a hard failure (bad credentials, network blackhole)
+        burns that budget and triggers a long lockout. After 5 consecutive
+        sub-10s sessions without READY, cool down for 10 minutes.
+
+        Args:
+            quick_failures: Current streak of rapid failed attempts.
+            started_at: Wall-clock start of the finished attempt.
+
+        Returns:
+            Updated streak count.
+        """
+        if time.time() - started_at >= 10.0 or self._ready_received:
+            return 0
+        quick_failures += 1
+        if quick_failures >= 5:
+            logger.warning(
+                "[QQOfficialFull] %d rapid failed gateway sessions without "
+                "READY; cooling down 600s to protect session_start_limit",
+                quick_failures,
+            )
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=600.0)
+            except TimeoutError:
+                pass
+            return 0
+        return quick_failures
 
     async def terminate(self) -> None:
         """Terminate gateway and HTTP resources."""

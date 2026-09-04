@@ -4,14 +4,19 @@ import asyncio
 import base64
 import hashlib
 import inspect
+import ipaddress
 import json
 import os
 import random
 import re
+import socket
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import websockets
@@ -99,6 +104,11 @@ WEBHOOK_TIMESTAMP_HEADER = "X-Signature-Timestamp"
 WEBHOOK_SEED_SIZE = 32
 WEBHOOK_SIGNATURE_SIZE = 64
 MD5_10M_SIZE = 10_002_432
+MAX_DATA_URL_BYTES = 10 * 1024 * 1024
+WEBHOOK_MAX_BODY_BYTES = 1_048_576
+WEBHOOK_RATE_WINDOW_SECONDS = 60.0
+WEBHOOK_RATE_MAX_REQUESTS = 600
+WEBHOOK_RATE_MAX_KEYS = 4096
 
 
 class QQOfficialAPIError(Exception):
@@ -289,6 +299,339 @@ def _parse_face_message(content: str) -> str:
     return re.sub(r"<faceType=\d+[^>]*>", replace_face, content)
 
 
+# ── 出站文本清理 (移植自 openclaw-qqbot src/outbound/sanitize.ts) ──
+
+_INTERNAL_TAG_PATTERNS = (
+    re.compile(r"<system-reminder\b[^>]*>[\s\S]*?</system-reminder>", re.I),
+    re.compile(r"<previous_response\b[^>]*>[\s\S]*?</previous_response>", re.I),
+    re.compile(r"<\s*/?\s*(?:system-reminder|previous_response)\b[^>]*/?\s*>", re.I),
+    re.compile(r"`think`[\s\S]*?`/think`", re.I),
+    re.compile(r"<\s*/?\s*think\b[^>]*/?\s*>", re.I),
+    re.compile(r"<thinking\b[^>]*>[\s\S]*?</thinking>", re.I),
+    re.compile(r"<\s*/?\s*thinking\b[^>]*/?\s*>", re.I),
+)
+
+
+def _sanitize_qq_text(text: str) -> str:
+    """Strip framework scaffolding and model reasoning tags from outbound text.
+
+    Args:
+        text: Raw outbound text.
+
+    Returns:
+        Sanitized text.
+    """
+    result = text
+    for pattern in _INTERNAL_TAG_PATTERNS:
+        result = pattern.sub("", result)
+    return result.strip()
+
+
+# ── Table-aware 长文本分块 (移植自 openclaw-qqbot src/channel.ts chunker) ──
+
+TEXT_CHUNK_LIMIT = 5000
+_GFM_TABLE_DATA_RE = re.compile(r"^\|.+\|.*\|")
+_GFM_TABLE_SEP_RE = re.compile(r"^\|[\s:-]+\|")
+
+
+def _is_gfm_table_line(line: str) -> bool:
+    """Check whether a line is a GFM table data or separator row.
+
+    Args:
+        line: One text line.
+
+    Returns:
+        Whether the line belongs to a markdown table.
+    """
+    return bool(_GFM_TABLE_DATA_RE.match(line) or _GFM_TABLE_SEP_RE.match(line))
+
+
+def _chunk_text(text: str, limit: int = TEXT_CHUNK_LIMIT) -> list[str]:
+    """Split text on line boundaries keeping markdown tables intact.
+
+    Args:
+        text: Text to split.
+        limit: Max chunk length.
+
+    Returns:
+        One or more chunks, each within the limit when possible.
+    """
+    lines: list[str] = []
+    for raw_line in text.split("\n"):
+        if len(raw_line) <= limit or _is_gfm_table_line(raw_line):
+            lines.append(raw_line)
+        else:
+            # hard split over-long non-table lines to respect the API limit
+            lines.extend(
+                raw_line[i : i + limit] for i in range(0, len(raw_line), limit)
+            )
+    chunks: list[str] = []
+    current = ""
+    table_buffer: list[str] = []
+
+    def flush_table() -> None:
+        nonlocal current
+        if not table_buffer:
+            return
+        table_block = "\n".join(table_buffer)
+        candidate = f"{current}\n{table_block}" if current else table_block
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = table_block
+        else:
+            current = candidate
+        table_buffer.clear()
+
+    for line in lines:
+        if _is_gfm_table_line(line):
+            table_buffer.append(line)
+            continue
+        flush_table()
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    flush_table()
+    if current:
+        chunks.append(current)
+    return chunks if chunks else [text]
+
+
+# ── SSRF 防护 (移植自 openclaw-qqbot src/utils/ssrf-guard.ts) ──
+
+_ALLOWED_REMOTE_SCHEMES = {"http", "https"}
+
+_QQ_TRUSTED_DOMAINS = frozenset(
+    {
+        "api.sgroup.qq.com",
+        "sandbox.api.sgroup.qq.com",
+        "bots.qq.com",
+        "multimedia.nt.qq.com.cn",
+        "multimedia.nt.qq.com",
+        "grouppro.grouppro.qq.com",
+    }
+)
+
+
+def _is_reserved_addr(ip: str) -> bool:
+    """Check whether an IP falls in a private / reserved / metadata range.
+
+    Args:
+        ip: IPv4 or IPv6 address string.
+
+    Returns:
+        Whether the address must not be fetched.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return bool(
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _is_qq_trusted_domain(hostname: str) -> bool:
+    """Check hostname against QQ official domain whitelist (one sub level).
+
+    Args:
+        hostname: Lowercase hostname.
+
+    Returns:
+        Whether the host is trusted.
+    """
+    if hostname in _QQ_TRUSTED_DOMAINS:
+        return True
+    dot = hostname.find(".")
+    return dot > 0 and hostname[dot + 1 :] in _QQ_TRUSTED_DOMAINS
+
+
+async def _validate_remote_url(raw: str) -> None:
+    """Validate a remote URL is safe to fetch (anti-SSRF).
+
+    Args:
+        raw: URL to validate.
+
+    Raises:
+        QQOfficialAPIError: If the scheme is unsupported or the target
+            resolves to a private / reserved address.
+    """
+    parsed = urlparse(raw)
+    if parsed.scheme not in _ALLOWED_REMOTE_SCHEMES:
+        raise QQOfficialAPIError(
+            "GET", raw, 0, f'不支持的协议 "{parsed.scheme}"，仅允许 http/https'
+        )
+    hostname = parsed.hostname or ""
+    if _is_qq_trusted_domain(hostname):
+        return
+
+    def resolve() -> list[str]:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            infos = socket.getaddrinfo(hostname, port)
+        except socket.gaierror:
+            return []
+        return [str(info[4][0]) for info in infos]
+
+    ips = await asyncio.to_thread(resolve)
+    for ip in ips:
+        if _is_reserved_addr(ip):
+            raise QQOfficialAPIError(
+                "GET",
+                raw,
+                0,
+                f'禁止访问内网地址 "{ip}"，已拦截潜在的 SSRF 请求',
+            )
+
+
+# ── Markdown 图片尺寸探测 (移植自 openclaw-qqbot src/outbound/image-size.ts) ──
+
+_IMAGE_SIZE_CACHE_TTL = 3600.0
+_image_size_cache: dict[str, tuple[tuple[int, int] | None, float]] = {}
+_MD_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\((\S+?)(?:\s+[\"'][^\"']*[\"'])?\)")
+
+
+def _parse_image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Parse width/height from image header bytes (PNG/JPEG/GIF/WebP).
+
+    Args:
+        data: Leading bytes of an image file.
+
+    Returns:
+        (width, height) or None when unparsable.
+    """
+    if len(data) < 8:
+        return None
+    if data[:4] == b"\x89PNG" and len(data) >= 24:
+        return (
+            int.from_bytes(data[16:20], "big"),
+            int.from_bytes(data[20:24], "big"),
+        )
+    if data[:2] == b"\xff\xd8":
+        offset = 2
+        while offset < len(data) - 9:
+            if data[offset] != 0xFF:
+                offset += 1
+                continue
+            marker = data[offset + 1]
+            if 0xC0 <= marker <= 0xCF and marker not in {0xC4, 0xC8, 0xCC}:
+                return (
+                    int.from_bytes(data[offset + 7 : offset + 9], "big"),
+                    int.from_bytes(data[offset + 5 : offset + 7], "big"),
+                )
+            offset += 2 + int.from_bytes(data[offset + 2 : offset + 4], "big")
+    if data[:3] == b"GIF" and len(data) >= 10:
+        return (
+            int.from_bytes(data[6:8], "little"),
+            int.from_bytes(data[8:10], "little"),
+        )
+    if len(data) >= 30 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8 ":
+            return (
+                int.from_bytes(data[26:28], "little") & 0x3FFF,
+                int.from_bytes(data[28:30], "little") & 0x3FFF,
+            )
+        if chunk == b"VP8L" and len(data) >= 25:
+            bits = int.from_bytes(data[21:25], "little")
+            return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    return None
+
+
+async def _get_image_size(
+    http: httpx.AsyncClient, url: str, timeout: float = 5.0
+) -> tuple[int, int] | None:
+    """Probe image dimensions via a ranged HEAD-style fetch, with caching.
+
+    Args:
+        http: Shared HTTP client.
+        url: Image URL.
+        timeout: Probe timeout in seconds.
+
+    Returns:
+        (width, height) or None on any failure.
+    """
+    cached = _image_size_cache.get(url)
+    now = time.time()
+    if cached and now < cached[1]:
+        return cached[0]
+    size: tuple[int, int] | None = None
+    try:
+        current = url
+        for _hop in range(4):
+            await _validate_remote_url(current)
+            response = await http.get(
+                current,
+                headers={"Range": "bytes=0-32767"},
+                timeout=timeout,
+                follow_redirects=False,
+            )
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    break
+                current = urljoin(current, location)
+                continue
+            if response.status_code in {200, 206}:
+                size = _parse_image_dimensions(response.content)
+            break
+    except Exception as exc:
+        logger.debug("[QQOfficialFull] Image size probe failed for %s: %s", url, exc)
+    if len(_image_size_cache) > 512:
+        _image_size_cache.clear()
+    _image_size_cache[url] = (size, now + _IMAGE_SIZE_CACHE_TTL)
+    return size
+
+
+def _format_qq_markdown_image(url: str, size: tuple[int, int] | None) -> str:
+    """Render a QQ markdown image tag with optional size hint.
+
+    Args:
+        url: Image URL.
+        size: Optional (width, height) hint.
+
+    Returns:
+        Markdown image string.
+    """
+    if size:
+        return f"![img #{size[0]}x{size[1]}]({url})"
+    return f"![img]({url})"
+
+
+async def _enhance_markdown_images(http: httpx.AsyncClient, text: str) -> str:
+    """Rewrite markdown image links with QQ size hints.
+
+    Args:
+        http: Shared HTTP client.
+        text: Outbound markdown text.
+
+    Returns:
+        Text with probed image tags rewritten.
+    """
+    if "![" not in text:
+        return text
+    parts: list[str] = []
+    last = 0
+    for match in _MD_IMAGE_PATTERN.finditer(text):
+        parts.append(text[last : match.start()])
+        url = match.group(1)
+        rendered = match.group(0)
+        if url.startswith(("http://", "https://")):
+            size = await _get_image_size(http, url)
+            rendered = _format_qq_markdown_image(url, size)
+        parts.append(rendered)
+        last = match.end()
+    parts.append(text[last:])
+    return "".join(parts)
+
+
 async def _maybe_await(value: Any) -> Any:
     """Await a value only when it is awaitable.
 
@@ -301,6 +644,462 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+# ── 被动回复限额 (移植自 openclaw-qqbot src/outbound/reply-limiter.ts) ──
+
+
+class ReplyLimiter:
+    """Track passive replies per source message and cap them.
+
+    Args:
+        limit: Max passive replies per message.
+        ttl_seconds: Message id validity window in seconds.
+        max_tracked: LRU cap on tracked messages.
+    """
+
+    def __init__(
+        self,
+        limit: int = 4,
+        ttl_seconds: float = 3600.0,
+        max_tracked: int = 10_000,
+    ) -> None:
+        self.limit = limit
+        self.ttl_seconds = ttl_seconds
+        self.max_tracked = max_tracked
+        self._messages: OrderedDict[str, dict[str, float]] = OrderedDict()
+
+    def check_limit(self, message_id: str) -> tuple[bool, int, str | None]:
+        """Check whether another passive reply is allowed for a message.
+
+        Args:
+            message_id: Source QQ message id.
+
+        Returns:
+            allowed, remaining, and fallback reason tuple.
+        """
+        tracked = self._messages.get(message_id)
+        if tracked is None:
+            return True, self.limit, None
+        if time.time() - tracked["first_seen_at"] > self.ttl_seconds:
+            del self._messages[message_id]
+            return False, 0, "expired"
+        remaining = max(0, self.limit - int(tracked["count"]))
+        if remaining <= 0:
+            return False, 0, "limit_exceeded"
+        return True, remaining, None
+
+    def record(self, message_id: str) -> None:
+        """Record one passive reply for a message.
+
+        Args:
+            message_id: Source QQ message id.
+        """
+        tracked = self._messages.get(message_id)
+        if tracked is not None:
+            tracked["count"] += 1
+            self._messages.move_to_end(message_id)
+            return
+        while len(self._messages) >= self.max_tracked:
+            self._messages.popitem(last=False)
+        self._messages[message_id] = {
+            "count": 1.0,
+            "first_seen_at": time.time(),
+        }
+
+    def clear(self) -> None:
+        """Drop all tracked messages."""
+        self._messages.clear()
+
+
+# ── 被动回复 msgId 缓存 (移植自 openclaw-qqbot src/features/msgid-cache.ts) ──
+
+_MSGID_MAX_PER_TARGET = 10
+_MSGID_TTL_SECONDS = {"group": 5 * 60.0, "c2c": 30 * 60.0}
+_MSGID_MAX_TARGETS = 200
+
+
+class MsgIdCache:
+    """Cache recent inbound msg ids per target for passive replies."""
+
+    def __init__(self) -> None:
+        self._cache: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+
+    def cache(self, scope: str, target_id: str, msg_id: str) -> None:
+        """Remember one recent msg id for a target.
+
+        Args:
+            scope: group or c2c.
+            target_id: QQ target id.
+            msg_id: QQ message id.
+        """
+        if not scope or not target_id or not msg_id:
+            return
+        key = f"{scope}:{target_id}"
+        entry = {"msg_id": msg_id, "timestamp": time.time()}
+        existing = self._cache.get(key)
+        if existing is not None:
+            existing.append(entry)
+            del existing[:-_MSGID_MAX_PER_TARGET]
+            self._cache.move_to_end(key)
+            return
+        self._cache[key] = [entry]
+        while len(self._cache) > _MSGID_MAX_TARGETS:
+            self._cache.popitem(last=False)
+
+    def get(self, scope: str, target_id: str) -> str | None:
+        """Return the newest non-expired msg id for a target.
+
+        Args:
+            scope: group or c2c.
+            target_id: QQ target id.
+
+        Returns:
+            Cached message id or None.
+        """
+        entries = self._cache.get(f"{scope}:{target_id}")
+        if not entries:
+            return None
+        ttl = _MSGID_TTL_SECONDS.get(scope, _MSGID_TTL_SECONDS["group"])
+        now = time.time()
+        for entry in reversed(entries):
+            if now - float(entry["timestamp"]) < ttl:
+                return str(entry["msg_id"])
+        return None
+
+    def clear(self, scope: str, target_id: str) -> None:
+        """Drop cached ids for one target.
+
+        Args:
+            scope: group or c2c.
+            target_id: QQ target id.
+        """
+        self._cache.pop(f"{scope}:{target_id}", None)
+
+
+# ── 引用索引持久化 (移植自 openclaw-qqbot src/features/ref-index-store.ts) ──
+
+_REF_INDEX_MAX_ENTRIES = 50_000
+_REF_INDEX_COMPACT_RATIO = 2.0
+
+
+class PersistedRefIndexStore:
+    """LRU ref-index (REFIDX key -> quoted message entry) with JSONL persistence.
+
+    Args:
+        file_path: JSONL store path.
+        max_entries: LRU and compact capacity.
+    """
+
+    def __init__(
+        self, file_path: Path, max_entries: int = _REF_INDEX_MAX_ENTRIES
+    ) -> None:
+        self.file_path = Path(file_path)
+        self.max_entries = max(100, max_entries)
+        self._memory: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._disk_line_count = 0
+        self._lock = threading.Lock()
+        self._init_load()
+
+    def _init_load(self) -> None:
+        """Replay JSONL from disk into the in-memory LRU."""
+        try:
+            if not self.file_path.exists():
+                return
+            lines = self.file_path.read_text(encoding="utf-8").splitlines()
+            parsed: list[tuple[float, str, dict[str, Any]]] = []
+            for line in lines:
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("k") and obj.get("v"):
+                    parsed.append((float(obj.get("t") or 0), str(obj["k"]), obj["v"]))
+            for _ts, key, value in sorted(parsed, key=lambda item: item[0]):
+                self._touch_memory(key, value)
+            self._disk_line_count = len(lines)
+            if self._disk_line_count > self.max_entries * _REF_INDEX_COMPACT_RATIO:
+                self._compact()
+        except Exception as exc:
+            logger.warning("[QQOfficialFull] ref-index init failed: %s", exc)
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        """Look up a stored ref entry by key.
+
+        Args:
+            key: REFIDX key or message id.
+
+        Returns:
+            Stored entry or None.
+        """
+        with self._lock:
+            value = self._memory.get(key)
+            return dict(value) if value else None
+
+    def set(self, key: str, entry: dict[str, Any]) -> None:
+        """Store one ref entry in memory and append it to disk.
+
+        Args:
+            key: REFIDX key or message id.
+            entry: Ref entry payload.
+        """
+        with self._lock:
+            self._touch_memory(key, entry)
+            try:
+                self.file_path.parent.mkdir(parents=True, exist_ok=True)
+                line = json.dumps(
+                    {"k": key, "v": entry, "t": int(time.time() * 1000)},
+                    ensure_ascii=False,
+                )
+                with self.file_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+                self._disk_line_count += 1
+                if self._disk_line_count > self.max_entries * _REF_INDEX_COMPACT_RATIO:
+                    self._compact()
+            except Exception as exc:
+                logger.warning("[QQOfficialFull] ref-index append failed: %s", exc)
+
+    def _touch_memory(self, key: str, entry: dict[str, Any]) -> None:
+        if key in self._memory:
+            del self._memory[key]
+        else:
+            while len(self._memory) >= self.max_entries:
+                self._memory.popitem(last=False)
+        self._memory[key] = entry
+
+    def _compact(self) -> None:
+        """Rewrite the JSONL file from memory, dropping redundant lines."""
+        tmp_path = self.file_path.with_suffix(self.file_path.suffix + ".tmp")
+        try:
+            now = int(time.time() * 1000)
+            lines = [
+                json.dumps({"k": key, "v": value, "t": now}, ensure_ascii=False)
+                for key, value in self._memory.items()
+            ]
+            content = "\n".join(lines) + "\n" if lines else ""
+            tmp_path.write_text(content, encoding="utf-8")
+            os.replace(tmp_path, self.file_path)
+            self._disk_line_count = len(lines)
+        except Exception as exc:
+            logger.warning("[QQOfficialFull] ref-index compact failed: %s", exc)
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    @property
+    def size(self) -> int:
+        """Number of in-memory entries."""
+        return len(self._memory)
+
+
+# ── 流式控制器 (移植自 openclaw-qqbot src/outbound/streaming-controller.ts) ──
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse whitespace runs into single spaces."""
+    return re.sub(r"\s+", " ", text)
+
+
+def _prefix_matches(accepted: str, incoming: str) -> bool:
+    """Check incoming text keeps the accepted prefix (whitespace tolerant)."""
+    if incoming.startswith(accepted):
+        return True
+    return _normalize_ws(incoming).startswith(_normalize_ws(accepted))
+
+
+def _longest_common_prefix_len(a: str, b: str) -> int:
+    """Return shared prefix length of two strings."""
+    limit = min(len(a), len(b))
+    i = 0
+    while i < limit and a[i] == b[i]:
+        i += 1
+    return i
+
+
+class QQStreamingController:
+    """Stateful C2C stream sender honouring QQ immutable-prefix constraints.
+
+    Args:
+        client: QQ REST client.
+        openid: C2C target openid.
+        event_message_id: Source message id for the stream payload.
+        on_completed: Callback(ret, content) when the stream session completes.
+    """
+
+    def __init__(
+        self,
+        client: QQOfficialClient,
+        openid: str,
+        event_message_id: str,
+        on_completed: Any = None,
+    ) -> None:
+        self.client = client
+        self.openid = openid
+        self.event_message_id = event_message_id
+        self.on_completed = on_completed
+        self.phase = "idle"
+        self.session_open = False
+        self.last_accepted_full = ""
+        self.last_seen_text = ""
+        self.sent_chunk_count = 0
+        self._stream_msg_id: str | None = None
+        self._index = 0
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the controller reached a final phase."""
+        return self.phase in {"done", "failed"}
+
+    @property
+    def should_fallback_to_static(self) -> bool:
+        """Whether the stream failed without sending anything usable."""
+        return self.is_terminal and self.sent_chunk_count == 0
+
+    def _transition(self, next_phase: str, reason: str) -> None:
+        if self.phase != next_phase:
+            logger.info(
+                "[QQOfficialFull] stream phase: %s -> %s (%s)",
+                self.phase,
+                next_phase,
+                reason,
+            )
+            self.phase = next_phase
+
+    async def on_partial(self, text: str) -> None:
+        """Feed one cumulative snapshot from the model.
+
+        Args:
+            text: Full text so far.
+        """
+        if self.is_terminal or not text:
+            return
+        self.last_seen_text = text
+        if _prefix_matches(self.last_accepted_full, text):
+            if len(text) != len(self.last_accepted_full):
+                await self._send_update(text)
+            return
+        if not self.last_accepted_full:
+            await self._send_update(text)
+            return
+        if len(text) < len(self.last_accepted_full):
+            logger.info(
+                "[QQOfficialFull] stream new reply: %d -> %d chars",
+                len(self.last_accepted_full),
+                len(text),
+            )
+            await self._complete_session("new_reply")
+            self.last_accepted_full = ""
+            await self._send_update(text)
+            return
+        common_len = _longest_common_prefix_len(self.last_accepted_full, text)
+        merged = self.last_accepted_full + text[common_len:]
+        logger.warning(
+            "[QQOfficialFull] stream prefix rewritten (common=%d), "
+            "appending tail to keep accepted prefix",
+            common_len,
+        )
+        await self._send_update(merged)
+
+    async def finalize(self) -> None:
+        """Close the stream and settle the final phase."""
+        if self.is_terminal:
+            return
+        if self.session_open:
+            await self._complete_session("done")
+            self._transition("done", "finalize")
+            logger.info(
+                "[QQOfficialFull] stream done: chunks=%d chars=%d",
+                self.sent_chunk_count,
+                len(self.last_accepted_full),
+            )
+            return
+        if self.sent_chunk_count > 0:
+            self._transition("done", "finalize:no_session")
+        else:
+            self._transition("failed", "finalize:fallback")
+
+    async def abort(self, reason: str = "manual") -> None:
+        """Abort the stream, completing any open session.
+
+        Args:
+            reason: Abort reason for logs.
+        """
+        if self.is_terminal:
+            return
+        logger.warning(
+            "[QQOfficialFull] aborting stream: reason=%s sent=%d",
+            reason,
+            self.sent_chunk_count,
+        )
+        await self._complete_session(f"abort:{reason}")
+        self._transition("failed", f"abort:{reason}")
+
+    async def _send_update(self, text: str) -> None:
+        if not self.session_open:
+            self.session_open = True
+            self._transition("streaming", "first_chunk")
+        payload: dict[str, Any] = {
+            "input_mode": 1,
+            "input_state": 1,
+            "content_type": 1,
+            "content_raw": text,
+            "event_id": self.event_message_id,
+            "msg_id": self.event_message_id,
+            "msg_seq": random.randint(1, 65535),
+            "index": self._index,
+        }
+        if self._stream_msg_id:
+            payload["stream_msg_id"] = self._stream_msg_id
+        try:
+            ret = await self.client.send_stream_message(self.openid, payload)
+        except Exception as exc:
+            logger.error(
+                "[QQOfficialFull] stream update failed (len=%d): %s",
+                len(text),
+                exc,
+            )
+            self.session_open = False
+            self._transition("failed", "update_error")
+            return
+        self._stream_msg_id = (
+            ret.get("id") or ret.get("stream_msg_id") or self._stream_msg_id
+        )
+        self._index += 1
+        self.last_accepted_full = text
+        self.sent_chunk_count += 1
+
+    async def _complete_session(self, reason: str = "done") -> None:
+        if not self.session_open:
+            return
+        payload: dict[str, Any] = {
+            "input_mode": 1,
+            "input_state": 2,
+            "content_type": 1,
+            "content_raw": self.last_accepted_full or "\n",
+            "event_id": self.event_message_id,
+            "msg_id": self.event_message_id,
+            "msg_seq": random.randint(1, 65535),
+            "index": self._index,
+        }
+        if self._stream_msg_id:
+            payload["stream_msg_id"] = self._stream_msg_id
+        try:
+            ret = await self.client.send_stream_message(self.openid, payload)
+            self._index += 1
+            if self.on_completed and ret:
+                try:
+                    self.on_completed(ret, self.last_accepted_full)
+                except Exception as exc:
+                    logger.debug("[QQOfficialFull] stream ref-index failed: %s", exc)
+        except Exception as exc:
+            logger.error("[QQOfficialFull] stream complete failed: %s", exc)
+        self.session_open = False
+        if reason.startswith("new_reply"):
+            self._stream_msg_id = None
+            self._index = 0
 
 
 class QQOfficialClient:
@@ -345,6 +1144,11 @@ class QQOfficialClient:
     async def close(self) -> None:
         """Close the underlying HTTP client."""
         await self._http.aclose()
+
+    @property
+    def http(self) -> httpx.AsyncClient:
+        """Return the shared HTTP client for direct fetches."""
+        return self._http
 
     def clear_token(self) -> None:
         """Clear cached access token."""
@@ -524,7 +1328,21 @@ class QQOfficialClient:
 
         Returns:
             Upload response dict.
+
+        Raises:
+            QQOfficialAPIError: If a base64/data-URL source exceeds limits.
         """
+        if (
+            source.startswith(("data:", "base64://"))
+            and len(source) > MAX_DATA_URL_BYTES
+        ):
+            size_mb = len(source) / (1024 * 1024)
+            raise QQOfficialAPIError(
+                "POST",
+                self._media_upload_path(scope, target_id),
+                0,
+                f"Data URL 过大（{size_mb:.1f}MB，最大 10MB）",
+            )
         local_path = self._source_to_local_path(source)
         if local_path and os.path.getsize(local_path) >= self.chunked_upload_threshold:
             return await self._upload_media_chunked(
@@ -565,6 +1383,8 @@ class QQOfficialClient:
             "file_type": file_type,
             "srv_send_msg": srv_send_msg,
         }
+        if url:
+            await _validate_remote_url(url)
         if file_data:
             payload["file_data"] = file_data
         if url:
@@ -942,15 +1762,7 @@ class QQOfficialFullMessageEvent(AstrMessageEvent):
         )
         if scene != "c2c":
             return
-        await self.adapter.client.send_v2_message(
-            "c2c",
-            self.session_id,
-            {
-                "msg_type": 6,
-                "input_notify": {"input_type": 1, "input_second": 60},
-                "msg_seq": random.randint(1, 65535),
-            },
-        )
+        await self.adapter._send_c2c_input_notify(self.session_id)
 
     async def send_streaming(
         self,
@@ -975,8 +1787,14 @@ class QQOfficialFullMessageEvent(AstrMessageEvent):
                 await self.send(buffer)
             return
 
-        stream_msg_id = None
-        index = 0
+        controller = QQStreamingController(
+            self.adapter.client,
+            self.session_id,
+            self.message_obj.message_id,
+            on_completed=lambda ret, content: self.adapter._store_ref_index(
+                ret, content, "c2c"
+            ),
+        )
         async for chain in generator:
             (
                 text,
@@ -990,37 +1808,12 @@ class QQOfficialFullMessageEvent(AstrMessageEvent):
                 continue
             if not text:
                 continue
-            payload = {
-                "input_mode": 1,
-                "input_state": 1,
-                "content_type": 1,
-                "content_raw": text,
-                "event_id": self.message_obj.message_id,
-                "msg_id": self.message_obj.message_id,
-                "msg_seq": random.randint(1, 65535),
-                "index": index,
-            }
-            if stream_msg_id:
-                payload["stream_msg_id"] = stream_msg_id
-            ret = await self.adapter.client.send_stream_message(
-                self.session_id, payload
-            )
-            stream_msg_id = ret.get("id") or ret.get("stream_msg_id") or stream_msg_id
-            index += 1
-        await self.adapter.client.send_stream_message(
-            self.session_id,
-            {
-                "input_mode": 1,
-                "input_state": 2,
-                "content_type": 1,
-                "content_raw": "\n",
-                "event_id": self.message_obj.message_id,
-                "msg_id": self.message_obj.message_id,
-                "msg_seq": random.randint(1, 65535),
-                "index": index,
-                **({"stream_msg_id": stream_msg_id} if stream_msg_id else {}),
-            },
-        )
+            await controller.on_partial(text)
+        await controller.finalize()
+        if controller.should_fallback_to_static and controller.last_seen_text:
+            buffer = MessageChain()
+            buffer.chain.append(Plain(controller.last_seen_text))
+            await self.send(buffer)
 
     async def get_group(
         self, group_id: str | None = None, **kwargs: Any
@@ -1126,7 +1919,12 @@ class QQOfficialFullPlatformAdapter(Platform):
             ),
         )
         self._sessions: dict[str, dict[str, Any]] = {}
+        self._reply_limiter = ReplyLimiter()
+        self._msg_id_cache = MsgIdCache()
         self._session_store_path = self._resolve_session_store_path(platform_config)
+        self._ref_index = PersistedRefIndexStore(
+            self._session_store_path.with_name("qqofficial_full_ref_index.jsonl")
+        )
         self._load_sessions()
         self._session_id: str | None = None
         self._last_seq: int | None = None
@@ -1134,6 +1932,7 @@ class QQOfficialFullPlatformAdapter(Platform):
         self._heartbeat_task: asyncio.Task | None = None
         self._shutdown_event = asyncio.Event()
         self._pending_event_extras: dict[str, dict[str, Any]] = {}
+        self._typing_tasks: set[asyncio.Task] = set()
 
     def _resolve_session_store_path(self, platform_config: dict) -> Path:
         """Resolve session store path from config.
@@ -1269,7 +2068,9 @@ class QQOfficialFullPlatformAdapter(Platform):
             reply_message_id: Current event message id for reply sends.
             from_event: Whether this is an event reply instead of proactive send.
         """
-        chunks = self._split_chain_by_media(message_chain)
+        chunks = []
+        for media_chunk in self._split_chain_by_media(message_chain):
+            chunks.extend(self._split_chain_by_length(media_chunk))
         for chunk in chunks:
             await self._send_one_chunk(
                 session,
@@ -1309,17 +2110,49 @@ class QQOfficialFullPlatformAdapter(Platform):
         if not text and not media and not raw_payload:
             return
 
+        passive_degraded = False
+        passive_msg_id = reply_id or reply_message_id
+        if from_event and scene in {"group", "c2c"} and passive_msg_id:
+            allowed, _remaining, reason = self._reply_limiter.check_limit(
+                passive_msg_id
+            )
+            if allowed:
+                self._reply_limiter.record(passive_msg_id)
+            else:
+                logger.info(
+                    "[QQOfficialFull] Passive reply limit hit (%s) for %s, "
+                    "degrading to proactive send",
+                    reason,
+                    passive_msg_id,
+                )
+                passive_degraded = True
+
         payload = await self._build_send_payload(
             message_chain,
             text,
             media,
-            reply_id or reply_message_id,
+            passive_msg_id,
             keyboard,
             raw_payload,
             session_info,
             scene,
-            from_event,
+            from_event and not passive_degraded,
         )
+        if passive_degraded:
+            payload.pop("msg_id", None)
+            payload.pop("message_reference", None)
+        cached_passive_id: str | None = None
+        if not from_event and scene in {"group", "c2c"} and not reply_id:
+            cached_passive_id = self._msg_id_cache.get(scene, target_id)
+            if cached_passive_id:
+                allowed, _remaining, _reason = self._reply_limiter.check_limit(
+                    cached_passive_id
+                )
+                if allowed:
+                    self._reply_limiter.record(cached_passive_id)
+                    payload["msg_id"] = cached_passive_id
+                else:
+                    cached_passive_id = None
         ret = await self._send_payload_with_fallback(scene, target_id, payload, text)
         sent_id = self._extract_message_id(ret)
         if sent_id:
@@ -1329,6 +2162,11 @@ class QQOfficialFullPlatformAdapter(Platform):
                 target_id=target_id,
                 message_id=sent_id,
             )
+        self._store_ref_index(
+            ret,
+            text or self._media_label_for_chain(message_chain),
+            scene,
+        )
 
     async def _build_send_payload(
         self,
@@ -1375,6 +2213,10 @@ class QQOfficialFullPlatformAdapter(Platform):
         elif scene in {"channel", "dm"}:
             payload.setdefault("content", text)
         elif use_markdown:
+            try:
+                text = await _enhance_markdown_images(self.client.http, text)
+            except Exception as exc:
+                logger.debug("[QQOfficialFull] Markdown image probe failed: %s", exc)
             payload.update({"markdown": {"content": text}, "msg_type": 2})
         else:
             payload.update({"content": text, "msg_type": 0})
@@ -1494,7 +2336,8 @@ class QQOfficialFullPlatformAdapter(Platform):
                     )
             else:
                 logger.debug("[QQOfficialFull] Ignored component: %s", component.type)
-        return "".join(text_parts), media, reply_id, keyboard, raw_payload or None
+        text = _sanitize_qq_text("".join(text_parts))
+        return text, media, reply_id, keyboard, raw_payload or None
 
     async def _upload_component_media(
         self, scene: str, target_id: str, component: BaseMessageComponent
@@ -1527,9 +2370,26 @@ class QQOfficialFullPlatformAdapter(Platform):
                 ).to_path(target_format="tencent_silk")
             except Exception as exc:
                 logger.warning("[QQOfficialFull] Audio conversion failed: %s", exc)
-            return await self.client.upload_media(
-                scope, target_id, VOICE_FILE_TYPE, source
-            )
+            try:
+                return await self.client.upload_media(
+                    scope, target_id, VOICE_FILE_TYPE, source
+                )
+            except QQOfficialAPIError as exc:
+                if source.startswith(("base64://", "data:")):
+                    file_name = "voice"
+                else:
+                    file_name = Path(str(source)).name or "voice"
+                logger.warning(
+                    "[QQOfficialFull] Voice upload failed (%s), sending as file",
+                    exc,
+                )
+                return await self.client.upload_media(
+                    scope,
+                    target_id,
+                    FILE_FILE_TYPE,
+                    source,
+                    file_name=file_name,
+                )
         if isinstance(component, Video):
             source = await component.convert_to_file_path()
             return await self.client.upload_media(
@@ -1569,6 +2429,32 @@ class QQOfficialFullPlatformAdapter(Platform):
         if current or not message_chain.chain:
             chunks.append(message_chain.derive(list(current)))
         return chunks
+
+    def _split_chain_by_length(
+        self, message_chain: MessageChain, limit: int = TEXT_CHUNK_LIMIT
+    ) -> list[MessageChain]:
+        """Split an over-long text chunk at line boundaries, tables intact.
+
+        Args:
+            message_chain: A single media-scoped message chain.
+            limit: Max plain-text characters per QQ message.
+
+        Returns:
+            One or more message chains.
+        """
+        plain_texts = [c for c in message_chain.chain if isinstance(c, Plain)]
+        total = sum(len(c.text) for c in plain_texts)
+        if total <= limit:
+            return [message_chain]
+        combined = "".join(c.text for c in plain_texts)
+        non_plain = [c for c in message_chain.chain if not isinstance(c, Plain)]
+        segments = _chunk_text(combined, limit)
+        out: list[MessageChain] = []
+        for index, segment in enumerate(segments):
+            comps: list[BaseMessageComponent] = list(non_plain) if index == 0 else []
+            comps.append(Plain(segment))
+            out.append(message_chain.derive(comps))
+        return out
 
     def remember_session(
         self,
@@ -1634,6 +2520,59 @@ class QQOfficialFullPlatformAdapter(Platform):
             QQ scene name or None.
         """
         return cast(str | None, self._sessions.get(session_id, {}).get("scene"))
+
+    def _store_ref_index(
+        self, ret: Any, content: str, scope: str, *, is_bot: bool = True
+    ) -> None:
+        """Persist REFIDX key of an API response for quote lookups.
+
+        Args:
+            ret: QQ send/response payload.
+            content: Display content of the referenced message.
+            scope: QQ scene name.
+            is_bot: Whether the entry was sent by this bot.
+        """
+        if not isinstance(ret, dict):
+            return
+        ext_info = ret.get("ext_info") or {}
+        ref_key = str(ext_info.get("ref_idx") or ret.get("msg_idx") or "")
+        if not ref_key:
+            return
+        message_id = ret.get("id") or ret.get("message_id") or ""
+        self._ref_index.set(
+            ref_key,
+            {
+                "messageId": str(message_id),
+                "content": content or "",
+                "senderId": str(ext_info.get("sender_id") or self.appid),
+                "senderName": str(ext_info.get("sender_name") or self.appid),
+                "timestamp": ret.get("timestamp")
+                or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "isBot": is_bot,
+                "scope": scope,
+            },
+        )
+
+    @staticmethod
+    def _media_label_for_chain(message_chain: MessageChain) -> str:
+        """Return a bracketed label for the first media component in a chain.
+
+        Args:
+            message_chain: AstrBot message chain.
+
+        Returns:
+            Media label such as 图片, or empty string.
+        """
+        for component in message_chain.chain:
+            if isinstance(component, Image):
+                return "[图片]"
+            if isinstance(component, Record):
+                return "[语音]"
+            if isinstance(component, Video):
+                return "[视频]"
+            if isinstance(component, File):
+                return "[文件]"
+        return ""
 
     def _extract_message_id(self, ret: Any) -> str | None:
         """Extract message id from a QQ API response.
@@ -1714,6 +2653,7 @@ class QQOfficialFullPlatformAdapter(Platform):
                 target_id=group_id,
                 message_id=abm.message_id,
             )
+            self._msg_id_cache.cache("group", group_id, abm.message_id)
         elif event_type == "C2C_MESSAGE_CREATE":
             author = payload.get("author") or {}
             sender_id = str(author.get("user_openid") or author.get("id") or "")
@@ -1728,6 +2668,7 @@ class QQOfficialFullPlatformAdapter(Platform):
                 target_id=sender_id,
                 message_id=abm.message_id,
             )
+            self._msg_id_cache.cache("c2c", sender_id, abm.message_id)
         elif event_type == "AT_MESSAGE_CREATE":
             author = payload.get("author") or {}
             channel_id = str(payload.get("channel_id") or "")
@@ -1807,10 +2748,49 @@ class QQOfficialFullPlatformAdapter(Platform):
         """
         msg_elements = payload.get("msg_elements") or []
         if not msg_elements:
-            return None
+            ref_key = str((payload.get("ext_info") or {}).get("ref_idx") or "")
+            entry = self._ref_index.get(ref_key) if ref_key else None
+            if not entry:
+                return None
+            content = str(entry.get("content") or "")
+            chain: list[BaseMessageComponent] = []
+            if content:
+                chain.append(Plain(content))
+            return Reply(
+                id=str(entry.get("messageId") or ref_key),
+                chain=chain,
+                sender_id=str(entry.get("senderId") or ""),
+                sender_nickname=str(entry.get("senderName") or ""),
+                message_str=content,
+            )
         ref = msg_elements[0]
         chain: list[BaseMessageComponent] = []
         text = _parse_face_message(str(ref.get("content") or "")).strip()
+        ref_key = str(ref.get("msg_idx") or "")
+        if not text and ref_key:
+            entry = self._ref_index.get(ref_key)
+            if entry:
+                text = str(entry.get("content") or "")
+        if text and ref_key:
+            author = ref.get("author") or {}
+            self._ref_index.set(
+                ref_key,
+                {
+                    "messageId": str(ref.get("id") or ref_key),
+                    "content": text,
+                    "senderId": str(
+                        author.get("member_openid")
+                        or author.get("user_openid")
+                        or author.get("id")
+                        or ""
+                    ),
+                    "senderName": str(author.get("username") or ""),
+                    "timestamp": ref.get("timestamp")
+                    or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "isBot": False,
+                    "scope": "",
+                },
+            )
         if text:
             chain.append(Plain(text))
         await self._append_attachments(chain, ref.get("attachments") or [])
@@ -1888,12 +2868,88 @@ class QQOfficialFullPlatformAdapter(Platform):
             event_id: QQ event id.
         """
         if event_type == "INTERACTION_CREATE":
-            interaction_id = str(payload.get("id") or "")
+            interaction_id = str(payload.get("id") or event_id or "")
             if interaction_id:
-                await self.client.acknowledge_interaction(interaction_id)
+                try:
+                    await self.client.acknowledge_interaction(interaction_id)
+                except Exception as exc:
+                    logger.warning("[QQOfficialFull] interaction ack failed: %s", exc)
+            abm = await self._parse_interaction_event(payload, interaction_id)
+            if abm:
+                self.commit_event(self.create_event(abm))
             return
         abm = await self._parse_message_event(event_type, payload, event_id)
+        if event_type == "C2C_MESSAGE_CREATE":
+            task = asyncio.create_task(self._send_c2c_input_notify(abm.session_id))
+            self._typing_tasks.add(task)
+            task.add_done_callback(self._typing_tasks.discard)
         self.commit_event(self.create_event(abm))
+
+    async def _send_c2c_input_notify(self, openid: str) -> None:
+        """Send QQ C2C input notification, swallowing failures.
+
+        Args:
+            openid: C2C target openid.
+        """
+        try:
+            await self.client.send_v2_message(
+                "c2c",
+                openid,
+                {
+                    "msg_type": 6,
+                    "input_notify": {"input_type": 1, "input_second": 60},
+                    "msg_seq": random.randint(1, 65535),
+                },
+            )
+        except Exception as exc:
+            logger.debug("[QQOfficialFull] typing notify failed: %s", exc)
+
+    async def _parse_interaction_event(
+        self, payload: dict, event_id: str
+    ) -> AstrBotMessage | None:
+        """Convert a QQ interaction (button click) into an AstrBot message.
+
+        Args:
+            payload: Interaction event payload.
+            event_id: QQ dispatch event id.
+
+        Returns:
+            Normalized AstrBot message, or None when unusable.
+        """
+        data = payload.get("data") or {}
+        resolved = data.get("resolved") or {}
+        operator_id = str(
+            payload.get("user_openid")
+            or resolved.get("user_id")
+            or resolved.get("user_openid")
+            or payload.get("openid")
+            or ""
+        )
+        group_id = str(payload.get("group_openid") or "")
+        abm = AstrBotMessage()
+        abm.raw_message = payload
+        abm.timestamp = int(time.time())
+        abm.message_id = str(payload.get("id") or event_id)
+        abm.message_str = ""
+        abm.message = [Json(data={"interaction": payload})]
+        abm.self_id = "qq_official_full"
+        if group_id:
+            abm.type = MessageType.GROUP_MESSAGE
+            abm.group_id = group_id
+            abm.session_id = group_id
+        elif operator_id:
+            abm.type = MessageType.FRIEND_MESSAGE
+            abm.session_id = operator_id
+        else:
+            return None
+        abm.sender = MessageMember(operator_id, "")
+        self._pending_event_extras[abm.message_id] = {
+            "qq_scene": self.session_scene(abm.session_id) or "unknown",
+            "event_id": event_id,
+            "raw_event_type": "INTERACTION_CREATE",
+            "qq_interaction": payload,
+        }
+        return abm
 
     async def _send_gateway_auth(self, websocket: Any, token: str) -> None:
         """Send identify or resume payload to QQ gateway.
@@ -2084,6 +3140,7 @@ class QQOfficialFullWebhookPlatformAdapter(QQOfficialFullPlatformAdapter):
         self._webhook_seen_events: dict[str, float] = {}
         self._webhook_shutdown = asyncio.Event()
         self._webhook_server: FastAPIWebhookServer | None = None
+        self._webhook_rate: OrderedDict[str, list[float]] = OrderedDict()
 
     def meta(self) -> PlatformMetadata:
         """Return platform metadata.
@@ -2099,6 +3156,46 @@ class QQOfficialFullWebhookPlatformAdapter(QQOfficialFullPlatformAdapter):
             support_proactive_message=True,
         )
 
+    def _client_ip(self, request: Any) -> str:
+        """Best-effort extraction of the client IP from a webhook request.
+
+        Args:
+            request: Webhook request wrapper.
+
+        Returns:
+            Client IP string or unknown marker.
+        """
+        headers = getattr(request, "headers", {}) or {}
+        forwarded = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
+        if forwarded:
+            return str(forwarded).split(",")[0].strip()
+        for attr in ("client_host", "remote_addr", "remote"):
+            value = getattr(request, attr, None)
+            if value:
+                return str(value)
+        client = getattr(request, "client", None)
+        host = getattr(client, "host", None) if client is not None else None
+        return str(host) if host else "unknown"
+
+    def _rate_allow(self, key: str) -> bool:
+        """Fixed-window rate limiter for webhook ingress.
+
+        Args:
+            key: Client identity (IP).
+
+        Returns:
+            Whether the request is within the window quota.
+        """
+        now = time.time()
+        slot = self._webhook_rate.get(key)
+        if slot is None or now - slot[1] >= WEBHOOK_RATE_WINDOW_SECONDS:
+            while len(self._webhook_rate) >= WEBHOOK_RATE_MAX_KEYS:
+                self._webhook_rate.popitem(last=False)
+            self._webhook_rate[key] = [1.0, now]
+            return True
+        slot[0] += 1
+        return slot[0] <= WEBHOOK_RATE_MAX_REQUESTS
+
     async def webhook_callback(self, request: Any) -> Any:
         """Handle a unified QQ webhook callback.
 
@@ -2108,9 +3205,22 @@ class QQOfficialFullWebhookPlatformAdapter(QQOfficialFullPlatformAdapter):
         Returns:
             QQ webhook acknowledgement or error tuple.
         """
+        if not self._rate_allow(self._client_ip(request)):
+            logger.warning("[QQOfficialFull] Webhook ingress rate limited")
+            return {"error": "Too Many Requests"}, 429
         body = await _maybe_await(request.get_data())
         if isinstance(body, str):
             body = body.encode("utf-8")
+        if len(body) > WEBHOOK_MAX_BODY_BYTES:
+            return {"error": "Payload Too Large"}, 413
+        request_headers = getattr(request, "headers", {}) or {}
+        content_type = str(
+            request_headers.get("Content-Type")
+            or request_headers.get("content-type")
+            or ""
+        )
+        if content_type and "json" not in content_type.lower():
+            return {"error": "Unsupported Media Type"}, 415
         try:
             envelope = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -2131,7 +3241,7 @@ class QQOfficialFullWebhookPlatformAdapter(QQOfficialFullPlatformAdapter):
             return {"plain_token": plain_token, "signature": signature}
 
         if bool(self.config.get("verify_webhook_signature", True)):
-            headers = request.headers
+            headers = request_headers
             timestamp = headers.get(WEBHOOK_TIMESTAMP_HEADER)
             tolerance = int(self.config.get("webhook_timestamp_tolerance_seconds") or 0)
             if tolerance > 0:

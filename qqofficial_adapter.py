@@ -7,7 +7,6 @@ import inspect
 import ipaddress
 import json
 import os
-import random
 import re
 import socket
 import threading
@@ -898,8 +897,25 @@ class PersistedRefIndexStore:
 # ── 流式控制器 (移植自 openclaw-qqbot src/outbound/streaming-controller.ts) ──
 
 STREAM_MIN_UPDATE_INTERVAL = 1.0
+# Official stream_messages REST protocol: input_mode/content_type are
+# STRINGS ("replace"/"append", "markdown"/"text"); input_state is an
+# integer (1=generating, 10=done). Numeric enums are rejected silently
+# and the server falls back to append semantics -> duplicated content.
+STREAM_INPUT_MODE_REPLACE = "replace"
+STREAM_CONTENT_TYPE_MARKDOWN = "markdown"
 STREAM_INPUT_STATE_GENERATING = 1
 STREAM_INPUT_STATE_DONE = 10
+
+_MSG_SEQ_LOCK = threading.Lock()
+_msg_seq_counter = 0
+
+
+def _next_msg_seq_global() -> int:
+    """Process-wide monotonic msg_seq (QQ dedupes out-of-order packets)."""
+    global _msg_seq_counter
+    with _MSG_SEQ_LOCK:
+        _msg_seq_counter += 1
+        return _msg_seq_counter
 
 
 def _normalize_ws(text: str) -> str:
@@ -951,7 +967,6 @@ class QQStreamingController:
         self.sent_chunk_count = 0
         self._stream_msg_id: str | None = None
         self._index = 0
-        self._msg_seq = 0
         self._last_send_ts = 0.0
 
     @property
@@ -964,7 +979,6 @@ class QQStreamingController:
         self.session_open = False
         self._stream_msg_id = None
         self._index = 0
-        self._msg_seq = 0
         self._last_send_ts = 0.0
         self.last_accepted_full = ""
 
@@ -976,9 +990,8 @@ class QQStreamingController:
         )
 
     def _next_msg_seq(self) -> int:
-        """Monotonically increasing msg_seq (QQ rejects out-of-order packets)."""
-        self._msg_seq += 1
-        return self._msg_seq
+        """Global monotonic msg_seq (QQ rejects out-of-order packets)."""
+        return _next_msg_seq_global()
 
     @property
     def should_fallback_to_static(self) -> bool:
@@ -1084,9 +1097,9 @@ class QQStreamingController:
             self.session_open = True
             self._transition("streaming", "first_chunk")
         payload: dict[str, Any] = {
-            "input_mode": 1,
+            "input_mode": STREAM_INPUT_MODE_REPLACE,
             "input_state": STREAM_INPUT_STATE_GENERATING,
-            "content_type": 1,
+            "content_type": STREAM_CONTENT_TYPE_MARKDOWN,
             "content_raw": text,
             "event_id": self.event_message_id,
             "msg_id": self.event_message_id,
@@ -1127,9 +1140,9 @@ class QQStreamingController:
         ):
             content = self.last_seen_text
         payload: dict[str, Any] = {
-            "input_mode": 1,
+            "input_mode": STREAM_INPUT_MODE_REPLACE,
             "input_state": STREAM_INPUT_STATE_DONE,
-            "content_type": 1,
+            "content_type": STREAM_CONTENT_TYPE_MARKDOWN,
             "content_raw": content or "\n",
             "event_id": self.event_message_id,
             "msg_id": self.event_message_id,
@@ -1153,7 +1166,6 @@ class QQStreamingController:
         if reason.startswith("new_reply"):
             self._stream_msg_id = None
             self._index = 0
-            self._msg_seq = 0
 
 
 class QQOfficialClient:
@@ -2289,7 +2301,7 @@ class QQOfficialFullPlatformAdapter(Platform):
             payload.update({"content": text, "msg_type": 0})
 
         if scene in {"group", "c2c"}:
-            payload.setdefault("msg_seq", random.randint(1, 65535))
+            payload.setdefault("msg_seq", _next_msg_seq_global())
         if reply_id and (from_event or scene in {"channel", "dm"}):
             payload.setdefault("msg_id", reply_id)
         if reply_id:
@@ -2965,7 +2977,7 @@ class QQOfficialFullPlatformAdapter(Platform):
                 {
                     "msg_type": 6,
                     "input_notify": {"input_type": 1, "input_second": 60},
-                    "msg_seq": random.randint(1, 65535),
+                    "msg_seq": _next_msg_seq_global(),
                 },
             )
         except Exception as exc:

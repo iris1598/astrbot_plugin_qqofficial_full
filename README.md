@@ -4,7 +4,7 @@
 
 支持 **WebSocket Gateway** 与 **HTTP Webhook** 两种事件接收方式，覆盖群聊、频道、私聊三大场景，实现丰富媒体类型的收发、流式输出、大文件分片上传等能力。
 
-> 插件版本：v0.4.2 | 作者：OpenCode
+> 插件版本：v0.5.0 | 作者：OpenCode
 
 ---
 
@@ -15,6 +15,16 @@
 |------|-----------|------|
 | WebSocket Gateway | `qq_official_full` | 通过 WebSocket 长连接接收事件推送，支持自动重连 |
 | HTTP Webhook | `qq_official_full_webhook` | 通过 HTTP 回调接收事件，支持 unified 和独立两种模式 |
+
+### Agent 技能与工具（移植自 OpenClaw skills/tools）
+| 名称 | 类型 | 说明 |
+|------|------|------|
+| `qqbot_platform_api` | LLM 工具 | QQ 开放平台统一 HTTP API 网关，自动填充鉴权 Token；支持 GET/POST/PUT/PATCH/DELETE 代理任意 OpenAPI 路径（含路径安全校验与结构化错误返回） |
+| `qqbot-channel` | Agent Skill | QQ 频道（Guild/Channel）管理技能：子频道/成员/公告/论坛/日程接口速查与操作流程，附 `references/api_references.md` 完整参数参考 |
+| `qqbot-remind` | Agent Skill | 提醒技能：强制「必须调用工具而非口头承诺」规则、时间换算指引、note 提醒模板、cron 速查表、AI 决策指南与回复模板（基于 AstrBot **内置** `future_task` 工具，插件不再单独提供提醒工具；需开启 `provider_settings.proactive_capability.add_cron_tools`，默认开启） |
+
+> 技能由 AstrBot 原生插件技能机制自动发现（`skills/<name>/SKILL.md`），在 WebUI「技能」页可开关；工具的完整 JSON Schema（enum/required）经 `context.add_llm_tools()` 注册。
+> `qqbot-upgrade` 技能为 OpenClaw npm 自升级专用，未移植——AstrBot 插件请通过插件管理器更新。
 
 ### 消息场景
 | 场景 | 说明 |

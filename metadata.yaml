@@ -1,6 +1,6 @@
 name: astrbot_plugin_qqofficial_full
 display_name: QQ Official Full Adapter
-desc: Full QQ Official platform adapters for AstrBot using QQ Open Platform REST, WebSocket gateway, and Webhook APIs.
-version: v0.4.2
+desc: Full QQ Official platform adapters for AstrBot using QQ Open Platform REST, WebSocket gateway, and Webhook APIs, with OpenClaw-port agent skills & tools (qqbot_platform_api + channel/remind skills).
+version: v0.5.0
 author: Iris1598
 repo: https://github.com/iris1598/astrbot_plugin_qqofficial_full

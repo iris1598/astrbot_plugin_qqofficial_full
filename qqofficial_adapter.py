@@ -13,6 +13,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urljoin, urlparse
@@ -80,6 +81,8 @@ OP_HEARTBEAT_ACK = 11
 OP_WEBHOOK_CALLBACK_ACK = 12
 OP_WEBHOOK_VALIDATION = 13
 
+INTENT_GUILDS = 1 << 0
+INTENT_GUILD_MEMBERS = 1 << 1
 INTENT_PUBLIC_GUILD_MESSAGES = 1 << 30
 INTENT_DIRECT_MESSAGE = 1 << 12
 INTENT_GROUP_AND_C2C = 1 << 25
@@ -88,6 +91,8 @@ INTENT_INTERACTION = 1 << 26
 INTENT_ALIASES = {
     "public_messages": INTENT_PUBLIC_GUILD_MESSAGES | INTENT_GROUP_AND_C2C,
     "public_guild_messages": INTENT_PUBLIC_GUILD_MESSAGES,
+    "guilds": INTENT_GUILDS,
+    "guild_members": INTENT_GUILD_MEMBERS,
     "group_and_c2c": INTENT_GROUP_AND_C2C,
     "group_c2c": INTENT_GROUP_AND_C2C,
     "direct_message": INTENT_DIRECT_MESSAGE,
@@ -107,7 +112,22 @@ WEBHOOK_TIMESTAMP_HEADER = "X-Signature-Timestamp"
 WEBHOOK_SEED_SIZE = 32
 WEBHOOK_SIGNATURE_SIZE = 64
 MD5_10M_SIZE = 10_002_432
-MAX_DATA_URL_BYTES = 10 * 1024 * 1024
+# 官方 SDK retry.ts 中的业务错误码
+UPLOAD_PREPARE_DAILY_LIMIT_CODE = 40093002  # 当日上传限额
+PART_FINISH_RETRYABLE_CODE = 40093001  # part_finish 可持久重试
+PART_FINISH_PERSIST_TIMEOUT_SECONDS = 120.0
+MAX_FACE_EXT_BYTES = 64 * 1024
+# QQ 平台富媒体硬限制 200MB（官方文档：超出直接报错）
+CHUNKED_UPLOAD_MAX_SIZE = 200 * 1024 * 1024
+# 分片上传推荐阈值 / 单次 base64 上限（官方 SDK：LARGE_FILE_THRESHOLD=5MB）
+DEFAULT_CHUNKED_UPLOAD_THRESHOLD = 5 * 1024 * 1024
+_MEDIA_TYPE_DEFAULT_SUFFIX = {
+    IMAGE_FILE_TYPE: ".jpg",
+    VIDEO_FILE_TYPE: ".mp4",
+    VOICE_FILE_TYPE: ".silk",
+    FILE_FILE_TYPE: ".bin",
+}
+MAX_DATA_URL_BYTES = 30 * 1024 * 1024  # ≈ SDK MAX_BASE64_CHECK_SIZE (20MB 原始 × 1.4)
 WEBHOOK_MAX_BODY_BYTES = 1_048_576
 WEBHOOK_RATE_WINDOW_SECONDS = 60.0
 WEBHOOK_RATE_MAX_REQUESTS = 600
@@ -308,18 +328,79 @@ def _parse_face_message(content: str) -> str:
     def replace_face(match: re.Match[str]) -> str:
         face_tag = match.group(0)
         ext_match = re.search(r'ext="([^"]*)"', face_tag)
-        if ext_match:
-            try:
-                ext_data = json.loads(
-                    base64.b64decode(ext_match.group(1)).decode("utf-8")
-                )
-                if text := ext_data.get("text"):
-                    return f"[face:{text}]"
-            except Exception:
-                return "[face]"
+        if not ext_match:
+            return "[face]"
+        ext_b64 = ext_match.group(1)
+        if len(ext_b64) * 3 // 4 > MAX_FACE_EXT_BYTES:
+            return "[face]"
+        try:
+            ext_data = json.loads(
+                base64.b64decode(ext_b64).decode("utf-8")
+            )
+        except Exception:
+            return face_tag
+        if text := ext_data.get("text"):
+            return f"[face:{text}]"
         return "[face]"
 
     return re.sub(r"<faceType=\d+[^>]*>", replace_face, content)
+
+
+def _parse_ref_indices(payload: dict) -> tuple[str, str]:
+    """Extract (ref_msg_idx, msg_idx) from a QQ inbound payload.
+
+    Mirrors the official SDK ``parseRefIndices``: the indexes live in the
+    ``message_scene.ext`` array as ``ref_msg_idx=`` / ``msg_idx=`` entries;
+    for quote messages (message_type 103) the first ``msg_elements`` entry's
+    ``msg_idx`` is the authoritative reference key.
+
+    Args:
+        payload: QQ event payload.
+
+    Returns:
+        (ref_msg_idx, msg_idx) tuple, empty strings when absent.
+    """
+    ref_idx = ""
+    msg_idx = ""
+    scene = payload.get("message_scene")
+    if isinstance(scene, dict):
+        for item in scene.get("ext") or []:
+            if not isinstance(item, str) or "=" not in item:
+                continue
+            key, _, value = item.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if not value:
+                continue
+            if key == "msg_idx":
+                msg_idx = value
+            elif key == "ref_msg_idx":
+                ref_idx = value
+    if str(payload.get("message_type")) == "103":
+        elements = payload.get("msg_elements") or []
+        if elements and isinstance(elements[0], dict) and elements[0].get("msg_idx"):
+            ref_idx = str(elements[0]["msg_idx"])
+    return ref_idx, msg_idx
+
+
+def _qq_timestamp_to_int(value: Any) -> int:
+    """Convert a QQ RFC3339 timestamp string to epoch seconds.
+
+    Args:
+        value: Raw QQ timestamp (string/number) or None.
+
+    Returns:
+        Epoch seconds, falling back to current time on any failure.
+    """
+    try:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("empty timestamp")
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        return int(datetime.fromisoformat(text).timestamp())
+    except (TypeError, ValueError):
+        return int(time.time())
 
 
 def _strip_mention_text(content: str, mentions: list | None) -> str:
@@ -1251,7 +1332,7 @@ class QQOfficialClient:
         api_base_url: str | None = None,
         token_url: str = TOKEN_URL,
         timeout: float = 30.0,
-        chunked_upload_threshold: int = 20 * 1024 * 1024,
+        chunked_upload_threshold: int = DEFAULT_CHUNKED_UPLOAD_THRESHOLD,
         url_direct_upload: bool = True,
         user_agent_suffix: str = "",
     ) -> None:
@@ -1272,7 +1353,54 @@ class QQOfficialClient:
         self._access_token: str | None = None
         self._access_token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
-        self._upload_cache: dict[tuple[str, str, str, int], tuple[dict, float]] = {}
+        self._upload_cache: OrderedDict[tuple[str, str, str, int], tuple[dict, float]] = (
+            OrderedDict()
+        )
+
+    def _cache_upload_result(
+        self, cache_key: tuple, result: dict
+    ) -> None:
+        """Store an upload result in the bounded LRU cache (SDK max 500)."""
+        self._upload_cache[cache_key] = (dict(result), time.time() + int(result.get("ttl") or 0))
+        self._upload_cache.move_to_end(cache_key)
+        while len(self._upload_cache) > 500:
+            self._upload_cache.popitem(last=False)
+
+    async def _request_with_retry(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_data: dict | None = None,
+        timeout: float | None = None,
+        max_retries: int = 2,
+        base_delay: float = 1.0,
+    ) -> Any:
+        """Request with transient-failure retry (SDK UPLOAD/COMPLETE policy).
+
+        Retries network errors and HTTP 5xx with exponential backoff; 4xx
+        business errors raise immediately.
+        """
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                return await self.request(
+                    method, path, json_data=json_data, timeout=timeout
+                )
+            except QQOfficialAPIError as exc:
+                retryable = exc.status_code == 0 or exc.status_code >= 500
+                if not retryable or attempts > max_retries:
+                    raise
+                logger.warning(
+                    "[QQOfficialFull] %s %s transient failure (%s), retry %d/%d",
+                    method,
+                    path,
+                    exc,
+                    attempts,
+                    max_retries,
+                )
+                await asyncio.sleep(base_delay * (2 ** (attempts - 1)))
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -1492,7 +1620,7 @@ class QQOfficialClient:
                 "POST",
                 self._media_upload_path(scope, target_id),
                 0,
-                f"Data URL 过大（{size_mb:.1f}MB，最大 10MB）",
+                f"Data URL 过大（{size_mb:.1f}MB，解码后最大约 20MB）",
             )
         local_path = self._source_to_local_path(source)
         if local_path and os.path.getsize(local_path) >= self.chunked_upload_threshold:
@@ -1525,13 +1653,20 @@ class QQOfficialClient:
                 # upload as base64 (openclaw urlDirectUpload=false behavior).
                 raw = await self._download_url_bytes(url)
                 if len(raw) >= self.chunked_upload_threshold:
-                    return await self._upload_media_chunked(
-                        scope,
-                        target_id,
-                        file_type,
-                        _persist_temp_media(raw, file_name),
-                        file_name=file_name,
-                    )
+                    tmp_file = _persist_temp_media(raw, file_name)
+                    try:
+                        return await self._upload_media_chunked(
+                            scope,
+                            target_id,
+                            file_type,
+                            tmp_file,
+                            file_name=file_name,
+                        )
+                    finally:
+                        try:
+                            os.remove(tmp_file)
+                        except OSError:
+                            pass
                 file_data = base64.b64encode(raw).decode("utf-8")
                 url = None
 
@@ -1558,16 +1693,18 @@ class QQOfficialClient:
         if file_type == FILE_FILE_TYPE and file_name:
             payload["file_name"] = _safe_filename(file_name)
 
-        result = await self.request(
+        result = await self._request_with_retry(
             "POST",
             self._media_upload_path(scope, target_id),
             json_data=payload,
             timeout=120.0,
+            max_retries=2,
+            base_delay=1.0,
         )
         if cache_key and isinstance(result, dict) and result.get("file_info"):
             ttl = int(result.get("ttl") or 0)
             if ttl > 0:
-                self._upload_cache[cache_key] = (dict(result), time.time() + ttl)
+                self._cache_upload_result(cache_key, result)
         return cast(dict, result)
 
     async def _download_url_bytes(self, url: str) -> bytes:
@@ -1653,26 +1790,62 @@ class QQOfficialClient:
         if cached and time.time() < cached[1]:
             return dict(cached[0])
 
+        if len(data) > CHUNKED_UPLOAD_MAX_SIZE:
+            size_mb = len(data) / (1024 * 1024)
+            raise QQOfficialAPIError(
+                "POST",
+                f"upload_prepare ({scope}:{target_id})",
+                0,
+                f"文件过大（{size_mb:.1f}MB，QQ 平台上限 200MB）",
+            )
         sha1 = hashlib.sha1(data).hexdigest()
         md5_10m = hashlib.md5(data[:MD5_10M_SIZE]).hexdigest()
         prefix = "/v2/groups" if scope in {"group", "groups"} else "/v2/users"
+        display_name = _safe_filename(file_name or Path(file_path).name)
+        if not Path(display_name).suffix:
+            display_name += _MEDIA_TYPE_DEFAULT_SUFFIX.get(file_type, ".bin")
+        # file_name is required by upload_prepare for every media type — the
+        # official SDK always sends it; omitting it makes the QQ inner proxy
+        # fail with "500 call inner proxy error".
         prepare_payload: dict[str, Any] = {
             "file_type": file_type,
+            "file_name": display_name,
             "file_size": len(data),
             "md5": md5,
             "sha1": sha1,
             "md5_10m": md5_10m,
         }
-        if file_name or file_type == FILE_FILE_TYPE:
-            prepare_payload["file_name"] = _safe_filename(
-                file_name or Path(file_path).name
-            )
-        prepared = await self.request(
-            "POST",
-            f"{prefix}/{target_id}/upload_prepare",
-            json_data=prepare_payload,
-            timeout=120.0,
-        )
+        # upload_prepare hits an upstream proxy that intermittently returns
+        # 5xx; official guidance is a single retry is usually enough.
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                prepared = await self.request(
+                    "POST",
+                    f"{prefix}/{target_id}/upload_prepare",
+                    json_data=prepare_payload,
+                    timeout=120.0,
+                )
+                break
+            except QQOfficialAPIError as exc:
+                if exc.biz_code == UPLOAD_PREPARE_DAILY_LIMIT_CODE:
+                    raise QQOfficialAPIError(
+                        "POST",
+                        f"{prefix}/{target_id}/upload_prepare",
+                        exc.status_code,
+                        f"上传已达当日限额，请明日再试（{exc.message}）",
+                        exc.biz_code,
+                    ) from exc
+                if attempts >= 3 or (exc.status_code < 500 and exc.status_code != 0):
+                    raise
+                logger.warning(
+                    "[QQOfficialFull] upload_prepare transient failure (%s), "
+                    "retrying %d/2",
+                    exc,
+                    attempts,
+                )
+                await asyncio.sleep(0.5 * attempts)
         upload_id = prepared["upload_id"]
         block_size = int(prepared.get("block_size") or len(data) or 1)
         parts = list(prepared.get("parts") or [])
@@ -1684,46 +1857,88 @@ class QQOfficialClient:
             start = (index - 1) * block_size
             chunk = data[start : start + block_size]
             async with semaphore:
-                response = await self._http.put(
-                    part["presigned_url"],
-                    content=chunk,
-                    headers={"Content-Length": str(len(chunk))},
-                    timeout=300.0,
-                )
-                response.raise_for_status()
+                # COS PUT with bounded retries (SDK PART_UPLOAD_MAX_RETRIES=2).
+                put_attempts = 0
+                while True:
+                    put_attempts += 1
+                    try:
+                        response = await self._http.put(
+                            part["presigned_url"],
+                            content=chunk,
+                            headers={"Content-Length": str(len(chunk))},
+                            timeout=300.0,
+                        )
+                        response.raise_for_status()
+                        break
+                    except Exception as exc:
+                        if put_attempts >= 3:
+                            raise QQOfficialAPIError(
+                                "PUT",
+                                f"part {index}/{len(parts)}",
+                                0,
+                                f"分片上传失败: {exc}",
+                            ) from exc
+                        logger.warning(
+                            "[QQOfficialFull] COS PUT part %d/%d attempt %d "
+                            "failed (%s), retrying",
+                            index,
+                            len(parts),
+                            put_attempts,
+                            exc,
+                        )
+                        await asyncio.sleep(1.0 * (2 ** (put_attempts - 1)))
                 part_md5 = hashlib.md5(chunk).hexdigest()
+                finish_payload = {
+                    "upload_id": upload_id,
+                    "part_index": index,
+                    "block_size": len(chunk),
+                    "md5": part_md5,
+                }
                 attempts = 0
+                persist_started_at = 0.0
                 while True:
                     attempts += 1
                     try:
                         await self.request(
                             "POST",
                             f"{prefix}/{target_id}/upload_part_finish",
-                            json_data={
-                                "upload_id": upload_id,
-                                "part_index": index,
-                                "block_size": len(chunk),
-                                "md5": part_md5,
-                            },
+                            json_data=finish_payload,
                             timeout=120.0,
                         )
                         return
                     except QQOfficialAPIError as exc:
-                        if attempts >= 3 or exc.status_code < 500:
+                        # SDK PART_FINISH_RETRY_POLICY: 2 retries with
+                        # exponential backoff; biz 40093001 additionally
+                        # enters a persistent 1s-interval loop (default 2min).
+                        if exc.biz_code == PART_FINISH_RETRYABLE_CODE:
+                            now = time.monotonic()
+                            if not persist_started_at:
+                                persist_started_at = now
+                            if (
+                                now - persist_started_at
+                                >= PART_FINISH_PERSIST_TIMEOUT_SECONDS
+                            ):
+                                raise
+                            await asyncio.sleep(1.0)
+                            attempts -= 1  # persistent loop does not exhaust retries
+                            continue
+                        if attempts > 2 or (exc.status_code < 500 and exc.status_code != 0):
                             raise
-                        await asyncio.sleep(0.1 * attempts)
+                        await asyncio.sleep(1.0 * (2 ** (attempts - 1)))
 
         await asyncio.gather(*(upload_part(part) for part in parts))
-        result = await self.request(
+        result = await self._request_with_retry(
             "POST",
             f"{prefix}/{target_id}/files",
             json_data={"upload_id": upload_id},
             timeout=120.0,
+            max_retries=2,
+            base_delay=2.0,
         )
         if isinstance(result, dict) and result.get("file_info"):
             ttl = int(result.get("ttl") or 0)
             if ttl > 0:
-                self._upload_cache[cache_key] = (dict(result), time.time() + ttl)
+                self._cache_upload_result(cache_key, result)
         return cast(dict, result)
 
     async def send_v2_message(
@@ -1966,7 +2181,9 @@ class QQOfficialFullMessageEvent(AstrMessageEvent):
         )
         if scene != "c2c":
             return
-        await self.adapter._send_c2c_input_notify(self.session_id)
+        await self.adapter._send_c2c_input_notify(
+            self.session_id, self.message_obj.message_id
+        )
 
     async def send_streaming(
         self,
@@ -2057,6 +2274,8 @@ DEFAULT_CONFIG = {
     "is_sandbox": False,
     "use_markdown": True,
     "intents": [
+        "guilds",
+        "guild_members",
         "public_messages",
         "public_guild_messages",
         "direct_message",
@@ -2065,7 +2284,7 @@ DEFAULT_CONFIG = {
     "intent_mask": "",
     "api_base_url": "",
     "gateway_url": "",
-    "chunked_upload_threshold": 20971520,
+    "chunked_upload_threshold": DEFAULT_CHUNKED_UPLOAD_THRESHOLD,
     "session_store_path": "",
     "url_direct_upload": True,
     "enable_streaming": True,
@@ -2138,8 +2357,8 @@ CONFIG_METADATA = {
     "chunked_upload_threshold": {
         "type": "int",
         "description": "Chunked upload threshold in bytes",
-        "hint": "本地文件超过该大小时走分片上传（默认 20MB）。",
-        "default": 20971520,
+        "hint": "本地文件超过该大小时走分片上传（默认 5MB，对齐官方推荐；单次 base64 上限 20MB）。",
+        "default": DEFAULT_CHUNKED_UPLOAD_THRESHOLD,
     },
     "session_store_path": {
         "type": "string",
@@ -2245,7 +2464,8 @@ class QQOfficialFullPlatformAdapter(Platform):
             is_sandbox=bool(platform_config.get("is_sandbox", False)),
             api_base_url=str(platform_config.get("api_base_url") or "") or None,
             chunked_upload_threshold=int(
-                platform_config.get("chunked_upload_threshold") or 20 * 1024 * 1024
+                platform_config.get("chunked_upload_threshold")
+                or DEFAULT_CHUNKED_UPLOAD_THRESHOLD
             ),
             url_direct_upload=bool(platform_config.get("url_direct_upload", True)),
             user_agent_suffix=str(platform_config.get("user_agent_suffix") or ""),
@@ -2265,6 +2485,7 @@ class QQOfficialFullPlatformAdapter(Platform):
         self._shutdown_event = asyncio.Event()
         self._pending_event_extras: dict[str, dict[str, Any]] = {}
         self._typing_tasks: set[asyncio.Task] = set()
+        self._bg_tasks: set[asyncio.Task] = set()
 
     def _resolve_session_store_path(self, platform_config: dict) -> Path:
         """Resolve session store path from config.
@@ -2333,7 +2554,9 @@ class QQOfficialFullPlatformAdapter(Platform):
         for item in platform_config.get("intents") or []:
             mask |= INTENT_ALIASES.get(str(item), 0)
         return mask or (
-            INTENT_PUBLIC_GUILD_MESSAGES
+            INTENT_GUILDS
+            | INTENT_GUILD_MEMBERS
+            | INTENT_PUBLIC_GUILD_MESSAGES
             | INTENT_DIRECT_MESSAGE
             | INTENT_GROUP_AND_C2C
             | INTENT_INTERACTION
@@ -2572,6 +2795,18 @@ class QQOfficialFullPlatformAdapter(Platform):
             payload.setdefault("message_reference", {"message_id": reply_id})
         if keyboard:
             payload["keyboard"] = keyboard
+        # SDK sendRaw auto-detects msg_type when a raw payload omits it.
+        if raw_payload and "msg_type" not in payload:
+            if payload.get("markdown"):
+                payload["msg_type"] = 2
+            elif payload.get("ark"):
+                payload["msg_type"] = 3
+            elif payload.get("embed"):
+                payload["msg_type"] = 4
+            elif payload.get("media"):
+                payload["msg_type"] = 7
+            else:
+                payload["msg_type"] = 0
         if not from_event and scene in {"group", "c2c"}:
             payload.pop("msg_id", None)
         elif not from_event and session_info.get("message_id"):
@@ -2948,7 +3183,7 @@ class QQOfficialFullPlatformAdapter(Platform):
         """
         abm = AstrBotMessage()
         abm.raw_message = payload
-        abm.timestamp = int(time.time())
+        abm.timestamp = _qq_timestamp_to_int(payload.get("timestamp"))
         abm.message_id = str(payload.get("id") or event_id or "")
         content = _parse_face_message(str(payload.get("content") or ""))
         components: list[BaseMessageComponent] = []
@@ -3068,6 +3303,30 @@ class QQOfficialFullPlatformAdapter(Platform):
             components.append(Plain(plain))
         await self._append_attachments(components, payload.get("attachments") or [])
         abm.message = components
+        _ref_idx, own_idx = _parse_ref_indices(payload)
+        if own_idx:
+            reg_author = payload.get("author") or {}
+            self._ref_index.set(
+                own_idx,
+                {
+                    "messageId": str(payload.get("id") or ""),
+                    "content": plain
+                    or self._media_label_for_chain(
+                        MessageChain(chain=components)
+                    ),
+                    "senderId": str(
+                        reg_author.get("member_openid")
+                        or reg_author.get("user_openid")
+                        or reg_author.get("id")
+                        or ""
+                    ),
+                    "senderName": str(reg_author.get("username") or ""),
+                    "timestamp": payload.get("timestamp")
+                    or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "isBot": False,
+                    "scope": qq_scene,
+                },
+            )
         if not getattr(abm, "self_id", ""):
             abm.self_id = "qq_official_full"
         self._pending_event_extras[abm.message_id] = {
@@ -3087,8 +3346,11 @@ class QQOfficialFullPlatformAdapter(Platform):
             Reply component or None.
         """
         msg_elements = payload.get("msg_elements") or []
+        ref_idx, _own_idx = _parse_ref_indices(payload)
         if not msg_elements:
-            ref_key = str((payload.get("ext_info") or {}).get("ref_idx") or "")
+            ref_key = ref_idx or str(
+                (payload.get("ext_info") or {}).get("ref_idx") or ""
+            )
             entry = self._ref_index.get(ref_key) if ref_key else None
             if not entry:
                 return None
@@ -3233,27 +3495,31 @@ class QQOfficialFullPlatformAdapter(Platform):
             and self.enable_c2c_typing
             and abm.session_id
         ):
-            task = asyncio.create_task(self._send_c2c_input_notify(abm.session_id))
+            task = asyncio.create_task(
+                self._send_c2c_input_notify(abm.session_id, abm.message_id)
+            )
             self._typing_tasks.add(task)
             task.add_done_callback(self._typing_tasks.discard)
         self.commit_event(self.create_event(abm))
 
-    async def _send_c2c_input_notify(self, openid: str) -> None:
+    async def _send_c2c_input_notify(
+        self, openid: str, message_id: str | None = None
+    ) -> None:
         """Send QQ C2C input notification, swallowing failures.
 
         Args:
             openid: C2C target openid.
+            message_id: Triggering message id for the passive notify.
         """
+        payload: dict[str, Any] = {
+            "msg_type": 6,
+            "input_notify": {"input_type": 1, "input_second": 60},
+            "msg_seq": _next_msg_seq_global(),
+        }
+        if message_id:
+            payload["msg_id"] = str(message_id)
         try:
-            await self.client.send_v2_message(
-                "c2c",
-                openid,
-                {
-                    "msg_type": 6,
-                    "input_notify": {"input_type": 1, "input_second": 60},
-                    "msg_seq": _next_msg_seq_global(),
-                },
-            )
+            await self.client.send_v2_message("c2c", openid, payload)
         except Exception as exc:
             logger.debug("[QQOfficialFull] typing notify failed: %s", exc)
 
@@ -3281,7 +3547,7 @@ class QQOfficialFullPlatformAdapter(Platform):
         group_id = str(payload.get("group_openid") or "")
         abm = AstrBotMessage()
         abm.raw_message = payload
-        abm.timestamp = int(time.time())
+        abm.timestamp = _qq_timestamp_to_int(payload.get("timestamp"))
         abm.message_id = str(payload.get("id") or event_id)
         abm.message_str = ""
         abm.message = [Json(data={"interaction": payload})]
@@ -3328,9 +3594,9 @@ class QQOfficialFullPlatformAdapter(Platform):
                     "intents": self.intents,
                     "shard": [0, 1],
                     "properties": {
-                        "os": os.name,
-                        "browser": "AstrBot",
-                        "device": "AstrBot",
+                        "$os": os.name,
+                        "$browser": "AstrBot",
+                        "$device": "AstrBot",
                     },
                 },
             }
@@ -3348,10 +3614,14 @@ class QQOfficialFullPlatformAdapter(Platform):
         Returns:
             Next reconnect delay in seconds.
         """
+        # SDK reconnect.ts semantics:
+        # 4004 -> refresh token only, session may still be resumable.
+        # 4006/4007/4009 and 4900-4913 -> session unusable, re-identify.
+        if exc.code == GATEWAY_CLOSE_AUTH_FAILED:
+            self.client.clear_token()
         if (
             exc.code
             in {
-                GATEWAY_CLOSE_AUTH_FAILED,
                 GATEWAY_CLOSE_INVALID_SESSION,
                 GATEWAY_CLOSE_SEQ_OUT_OF_RANGE,
                 GATEWAY_CLOSE_SESSION_TIMEOUT,
@@ -3665,12 +3935,31 @@ class QQOfficialFullWebhookPlatformAdapter(QQOfficialFullPlatformAdapter):
                 if now - seen_at <= 60
             }
             if event_id in self._webhook_seen_events:
-                return {"opcode": OP_WEBHOOK_CALLBACK_ACK}
+                return {"op": OP_WEBHOOK_CALLBACK_ACK, "d": 0}
             self._webhook_seen_events[event_id] = now
 
         if opcode == OP_DISPATCH and envelope.get("t"):
-            await self._dispatch_payload_event(str(envelope["t"]), data, event_id)
-        return {"opcode": OP_WEBHOOK_CALLBACK_ACK}
+            # ACK first and dispatch in the background (SDK WebhookTransport
+            # behavior): blocking here makes QQ time out the callback and
+            # re-deliver the event.
+            task = asyncio.create_task(
+                self._dispatch_payload_event(str(envelope["t"]), data, event_id)
+            )
+            self._bg_tasks.add(task)
+
+            def _on_bg_done(done_task: asyncio.Task) -> None:
+                self._bg_tasks.discard(done_task)
+                if done_task.cancelled():
+                    return
+                error = done_task.exception()
+                if error is not None:
+                    logger.error(
+                        "[QQOfficialFull] webhook dispatch failed: %s", error
+                    )
+
+            task.add_done_callback(_on_bg_done)
+        # SDK WebhookTransport ACK body: {"op": 12, "d": 0}
+        return {"op": OP_WEBHOOK_CALLBACK_ACK, "d": 0}
 
     async def run(self) -> None:
         """Run webhook mode, either unified or standalone."""

@@ -4,7 +4,7 @@
 
 支持 **WebSocket Gateway** 与 **HTTP Webhook** 两种事件接收方式，覆盖群聊、频道、私聊三大场景，实现丰富媒体类型的收发、流式输出、大文件分片上传等能力。
 
-> 插件版本：v0.4.1 | 作者：OpenCode
+> 插件版本：v0.4.2 | 作者：OpenCode
 
 ---
 
@@ -67,15 +67,21 @@
   TTL），主动发送时自动借用未过期 msgId 转为被动回复，规避主动消息频控
 - **引用索引持久化**：JSONL + LRU（上限 5 万条、超限自动 compact）存储
   REFIDX 键 ↔ 消息内容映射；出站成功（含流式收尾）自动登记 `ext_info.ref_idx`，
-  入站引用只带 key 不带内容时回查还原，换设备引用也能解析
+  入站同时解析 `message_scene.ext` 的 `msg_idx`/`ref_msg_idx` 并登记自身索引，
+  引用只带 key 不带内容时回查还原，换设备引用也能解析
 - **按钮交互事件路由**：`INTERACTION_CREATE` 先 ACK 再包装为 AstrBot 事件
   （`Json` 组件 + `qq_interaction` extra）投递到事件流，插件可监听按钮点击
 - **Table-aware 长文本分块**：超过 5000 字符的出站文本按行边界自动拆分，
   GFM Markdown 表格（表头+分隔行）保持完整不被切断
 - **语音降级发送**：语音（SILK）上传失败时自动改以文件类型发送，避免消息丢失
-- **Data URL 大小限制**：base64/data URL 媒体源超过 10MB 直接拒绝，防止内存膨胀
+- **Data URL 大小限制**：base64/data URL 媒体源解码后超过约 20MB 直接拒绝（对齐官方 SDK 单次上传上限）
+- **上传重试策略**：upload_prepare / 单次上传 / 分片 PUT / upload_part_finish /
+  complete 按官方 SDK 策略对瞬态 5xx 指数退避重试；`40093001` 进入持久重试循环
+  （1s 间隔、2 分钟超时）；`40093002` 报告当日上传限额；分片请求恒带 `file_name`
+  （缺失会触发平台 500 call inner proxy error）；200MB 平台硬限制前置检查
 - **Webhook 入站防护**：固定窗口限流（60s/600 次/IP）、1MB body 上限、
-  JSON Content-Type 强制校验
+  JSON Content-Type 强制校验、事件 ID 去重；op:0 分发转后台执行，
+  ACK 立即返回（避免 QQ 回调超时重推）
 - **自动输入提示**：收到 C2C 消息时自动发送「正在输入」状态（失败静默忽略）
 
 ---
@@ -101,11 +107,11 @@
 | `secret` | string | `""` | QQ Bot 的 Secret（密码字段） |
 | `is_sandbox` | bool | `false` | 是否使用沙箱环境 |
 | `use_markdown` | bool | `true` | 是否优先使用原生 Markdown 消息 |
-| `intents` | list | `["public_messages", "public_guild_messages", "direct_message", "interaction"]` | 网关监听的事件类型别名 |
+| `intents` | list | `["guilds", "guild_members", "public_messages", "public_guild_messages", "direct_message", "interaction"]` | 网关监听的事件类型别名（对齐 openclaw `FULL_INTENTS` 默认） |
 | `intent_mask` | string | `""` | 原始 intent 位掩码（覆盖 `intents`） |
 | `api_base_url` | string | `""` | API 基础 URL 覆盖（默认 prod: `https://api.sgroup.qq.com`，sandbox: `https://sandbox.api.sgroup.qq.com`） |
 | `gateway_url` | string | `""` | WebSocket 网关 URL 覆盖（默认 `wss://api.sgroup.qq.com/websocket`） |
-| `chunked_upload_threshold` | int | `20971520` | 分片上传阈值，单位字节（默认 20MB） |
+| `chunked_upload_threshold` | int | `5242880` | 分片上传阈值，单位字节（默认 5MB，对齐官方 SDK 推荐值；单次 base64 上限 20MB，平台硬限制 200MB） |
 | `session_store_path` | string | `""` | 会话持久化路径覆盖 |
 | `url_direct_upload` | bool | `true` | 公网 URL 直传 QQ 平台自行拉取；关闭时插件先下载再 Base64 上传（对齐 openclaw `urlDirectUpload`） |
 | `enable_streaming` | bool | `true` | 启用 C2C 流式回复；关闭时流式内容缓冲后整条发送（对齐 openclaw `streaming`） |
@@ -116,6 +122,8 @@
 
 | 别名 | 对应事件 |
 |------|---------|
+| `guilds` | 频道（GUILD）基础事件 |
+| `guild_members` | 频道成员基础事件 |
 | `public_messages` | 频道公开消息 + 群聊和 C2C 消息 |
 | `public_guild_messages` | 频道公开消息 |
 | `group_and_c2c` / `group_c2c` | 群聊和 C2C 消息 |

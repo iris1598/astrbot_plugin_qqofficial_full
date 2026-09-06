@@ -47,6 +47,10 @@ from astrbot.api.platform import (
 from astrbot.core.message.components import BaseMessageComponent
 from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.platform.webhook_server import FastAPIWebhookServer
+from astrbot.core.utils.astrbot_path import (
+    get_astrbot_data_path,
+    get_astrbot_temp_path,
+)
 from astrbot.core.utils.media_utils import MediaResolver, file_uri_to_path, is_file_uri
 from astrbot.core.utils.webhook_utils import log_webhook_info
 
@@ -234,6 +238,8 @@ def _normalize_url(url: str | None) -> str:
         return ""
     if url.startswith(("http://", "https://")):
         return url
+    if url.startswith("//"):
+        return f"https:{url}"
     return f"https://{url}"
 
 
@@ -271,6 +277,24 @@ def _safe_filename(name: str | None) -> str:
     return basename if basename and basename not in {".", ".."} else "file"
 
 
+def _persist_temp_media(data: bytes, file_name: str | None = None) -> str:
+    """Write bytes to AstrBot temp dir and return the file path.
+
+    Args:
+        data: File content.
+        file_name: Optional original file name for the extension.
+
+    Returns:
+        Temp file path string.
+    """
+    temp_dir = Path(get_astrbot_temp_path())
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(_safe_filename(file_name)).suffix
+    tmp_path = temp_dir / f"qqfull_upload_{os.urandom(8).hex()}{suffix}"
+    tmp_path.write_bytes(data)
+    return str(tmp_path)
+
+
 def _parse_face_message(content: str) -> str:
     """Convert QQ face tags to readable placeholders.
 
@@ -296,6 +320,43 @@ def _parse_face_message(content: str) -> str:
         return "[face]"
 
     return re.sub(r"<faceType=\d+[^>]*>", replace_face, content)
+
+
+def _strip_mention_text(content: str, mentions: list | None) -> str:
+    """Clean QQ <@openid> tokens, mirroring openclaw stripMentionText.
+
+    Bot self mentions are removed; other users' mentions are rewritten to
+    @nickname so downstream text stays readable.
+
+    Args:
+        content: Raw message content.
+        mentions: Mention entries from the QQ payload.
+
+    Returns:
+        Content with mention tokens cleaned.
+    """
+    if not content or not mentions:
+        return content
+    for mention in mentions:
+        if not isinstance(mention, dict):
+            continue
+        openid = str(
+            mention.get("member_openid")
+            or mention.get("user_openid")
+            or mention.get("id")
+            or ""
+        )
+        if not openid:
+            continue
+        replacement = ""
+        if not mention.get("is_you"):
+            display = mention.get("nickname") or mention.get("username")
+            if display:
+                replacement = f"@{display}"
+        content = content.replace(f"<@!{openid}>", replacement).replace(
+            f"<@{openid}>", replacement
+        )
+    return content
 
 
 # ── 出站文本清理 (移植自 openclaw-qqbot src/outbound/sanitize.ts) ──
@@ -1191,6 +1252,8 @@ class QQOfficialClient:
         token_url: str = TOKEN_URL,
         timeout: float = 30.0,
         chunked_upload_threshold: int = 20 * 1024 * 1024,
+        url_direct_upload: bool = True,
+        user_agent_suffix: str = "",
     ) -> None:
         self.appid = str(appid)
         self.secret = str(secret)
@@ -1201,7 +1264,11 @@ class QQOfficialClient:
         self.token_url = token_url
         self.timeout = timeout
         self.chunked_upload_threshold = chunked_upload_threshold
-        self._http = httpx.AsyncClient(timeout=timeout)
+        self.url_direct_upload = url_direct_upload
+        user_agent = "AstrBot/qq_official_full"
+        if user_agent_suffix:
+            user_agent = f"{user_agent} {user_agent_suffix.strip()}"
+        self._http = httpx.AsyncClient(timeout=timeout, headers={"User-Agent": user_agent})
         self._access_token: str | None = None
         self._access_token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
@@ -1316,6 +1383,24 @@ class QQOfficialClient:
             )
         except Exception as exc:
             raise QQOfficialAPIError(method, path, 0, str(exc)) from exc
+        if response.status_code == 401 and auth:
+            # Access token likely expired: refresh once and replay the request.
+            logger.debug("[QQOfficialFull] 401 from %s %s, refreshing token", method, path)
+            self.clear_token()
+            retry_headers = dict(headers or {})
+            retry_headers["Authorization"] = f"QQBot {await self.get_access_token()}"
+            retry_headers.setdefault("Content-Type", "application/json")
+            try:
+                response = await self._http.request(
+                    method,
+                    url,
+                    json=json_data,
+                    params=query_params,
+                    headers=retry_headers,
+                    timeout=timeout or self.timeout,
+                )
+            except Exception as exc:
+                raise QQOfficialAPIError(method, path, 0, str(exc)) from exc
         text = response.text
         if response.status_code >= 400:
             try:
@@ -1433,6 +1518,23 @@ class QQOfficialClient:
         else:
             file_data = source
 
+        if url:
+            await _validate_remote_url(url)
+            if not self.url_direct_upload:
+                # QQ platform may not reach the URL; download it ourselves and
+                # upload as base64 (openclaw urlDirectUpload=false behavior).
+                raw = await self._download_url_bytes(url)
+                if len(raw) >= self.chunked_upload_threshold:
+                    return await self._upload_media_chunked(
+                        scope,
+                        target_id,
+                        file_type,
+                        _persist_temp_media(raw, file_name),
+                        file_name=file_name,
+                    )
+                file_data = base64.b64encode(raw).decode("utf-8")
+                url = None
+
         cache_key = None
         if file_data:
             cache_key = (
@@ -1449,8 +1551,6 @@ class QQOfficialClient:
             "file_type": file_type,
             "srv_send_msg": srv_send_msg,
         }
-        if url:
-            await _validate_remote_url(url)
         if file_data:
             payload["file_data"] = file_data
         if url:
@@ -1469,6 +1569,44 @@ class QQOfficialClient:
             if ttl > 0:
                 self._upload_cache[cache_key] = (dict(result), time.time() + ttl)
         return cast(dict, result)
+
+    async def _download_url_bytes(self, url: str) -> bytes:
+        """Download remote media bytes for local re-upload.
+
+        Args:
+            url: Already SSRF-validated remote URL.
+
+        Returns:
+            Downloaded bytes.
+
+        Raises:
+            QQOfficialAPIError: On network or HTTP failure, or empty body.
+        """
+        data = b""
+        status = 0
+        current = url
+        try:
+            for _hop in range(5):
+                await _validate_remote_url(current)
+                response = await self._http.get(current, timeout=120.0)
+                status = response.status_code
+                if status in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location")
+                    if not location:
+                        break
+                    current = urljoin(current, location)
+                    continue
+                data = response.content
+                break
+        except QQOfficialAPIError:
+            raise
+        except Exception as exc:
+            raise QQOfficialAPIError("GET", url, 0, f"媒体下载失败: {exc}") from exc
+        if status >= 400 or not data:
+            raise QQOfficialAPIError(
+                "GET", url, status, "媒体下载失败或内容为空"
+            )
+        return data
 
     def _source_to_local_path(self, source: str) -> str | None:
         """Return a local path for path-like sources.
@@ -1845,7 +1983,7 @@ class QQOfficialFullMessageEvent(AstrMessageEvent):
         scene = self.get_extra("qq_scene") or self.adapter.session_scene(
             self.session_id
         )
-        if scene != "c2c":
+        if scene != "c2c" or not self.adapter.enable_streaming:
             buffer = MessageChain()
             async for chain in generator:
                 buffer.chain.extend(chain.chain)
@@ -1929,6 +2067,10 @@ DEFAULT_CONFIG = {
     "gateway_url": "",
     "chunked_upload_threshold": 20971520,
     "session_store_path": "",
+    "url_direct_upload": True,
+    "enable_streaming": True,
+    "enable_c2c_typing": True,
+    "user_agent_suffix": "",
 }
 
 DEFAULT_WEBHOOK_CONFIG = {
@@ -1943,23 +2085,130 @@ DEFAULT_WEBHOOK_CONFIG = {
 }
 
 CONFIG_METADATA = {
-    "appid": {"type": "string", "description": "QQ bot AppID", "default": ""},
-    "secret": {"type": "string", "description": "QQ bot secret", "default": ""},
-    "is_sandbox": {"type": "bool", "description": "Use sandbox API", "default": False},
+    "appid": {
+        "type": "string",
+        "description": "QQ bot AppID",
+        "hint": "QQ 开放平台机器人的 AppID。",
+        "default": "",
+    },
+    "secret": {
+        "type": "string",
+        "description": "QQ bot secret",
+        "hint": "QQ 开放平台机器人的 AppSecret，用于获取 token 与 Webhook 签名。",
+        "secret": True,
+        "show_key": True,
+        "default": "",
+    },
+    "is_sandbox": {
+        "type": "bool",
+        "description": "Use sandbox API",
+        "hint": "使用沙箱环境（测试机器人）。",
+        "default": False,
+    },
     "use_markdown": {
         "type": "bool",
         "description": "Prefer native markdown messages when possible",
+        "hint": "优先使用原生 Markdown 消息（需平台审核通过，失败自动降级纯文本）。",
         "default": True,
     },
     "intents": {
         "type": "list",
         "description": "Gateway intent aliases",
+        "hint": "WebSocket 网关监听的事件类型别名列表。",
         "default": DEFAULT_CONFIG["intents"],
     },
     "intent_mask": {
         "type": "string",
         "description": "Raw gateway intent mask override",
+        "hint": "原始 intent 位掩码（如 1075318862 或 0x40200C00），设置后覆盖 intents 列表。",
         "default": "",
+    },
+    "api_base_url": {
+        "type": "string",
+        "description": "API base URL override",
+        "hint": "REST API 基础地址覆盖，留空使用官方地址。",
+        "default": "",
+    },
+    "gateway_url": {
+        "type": "string",
+        "description": "WebSocket gateway URL override",
+        "hint": "网关地址覆盖，留空自动从 API 获取。",
+        "default": "",
+    },
+    "chunked_upload_threshold": {
+        "type": "int",
+        "description": "Chunked upload threshold in bytes",
+        "hint": "本地文件超过该大小时走分片上传（默认 20MB）。",
+        "default": 20971520,
+    },
+    "session_store_path": {
+        "type": "string",
+        "description": "Session store path override",
+        "hint": "会话持久化 JSON 路径覆盖，留空使用 data 目录下默认路径。",
+        "default": "",
+    },
+    "url_direct_upload": {
+        "type": "bool",
+        "description": "Pass public URLs directly to QQ platform",
+        "hint": "公网 URL 直传 QQ 平台自行拉取；关闭时插件先下载再 Base64 上传（适用于 QQ 无法访问目标 URL 的场景）。",
+        "default": True,
+    },
+    "enable_streaming": {
+        "type": "bool",
+        "description": "Enable C2C streaming replies",
+        "hint": "启用私聊流式输出（仅 C2C 场景支持，关闭时流式内容缓冲后整条发送）。",
+        "default": True,
+    },
+    "enable_c2c_typing": {
+        "type": "bool",
+        "description": "Auto send C2C typing indicator",
+        "hint": "收到私聊消息时自动发送“正在输入”状态。",
+        "default": True,
+    },
+    "user_agent_suffix": {
+        "type": "string",
+        "description": "User-Agent suffix",
+        "hint": "追加在 HTTP User-Agent 尾部，用于私有化部署标识。",
+        "default": "",
+    },
+}
+
+WEBHOOK_CONFIG_METADATA = {
+    "unified_webhook_mode": {
+        "type": "bool",
+        "description": "Use AstrBot unified webhook server",
+        "hint": "使用 AstrBot 统一 Webhook 服务（需填写 webhook_uuid）。",
+        "default": True,
+    },
+    "webhook_uuid": {
+        "type": "string",
+        "description": "Unified webhook UUID",
+        "hint": "统一 Webhook 回调路径的 UUID，在平台配置页查看回调地址。",
+        "default": "",
+    },
+    "verify_webhook_signature": {
+        "type": "bool",
+        "description": "Verify webhook Ed25519 signature",
+        "hint": "校验 Webhook 回调的 Ed25519 签名。",
+        "default": True,
+    },
+    "webhook_timestamp_tolerance_seconds": {
+        "type": "int",
+        "description": "Webhook timestamp tolerance in seconds",
+        "hint": "回调时间戳容差（秒），0 表示不校验时间戳。",
+        "default": 300,
+    },
+    "callback_server_host": {
+        "type": "string",
+        "description": "Standalone webhook server host",
+        "hint": "独立 Webhook 服务监听地址。",
+        "default": "0.0.0.0",
+    },
+    "port": {
+        "type": "int",
+        "description": "Standalone webhook server port",
+        "hint": "独立 Webhook 服务监听端口。",
+        "default": 6197,
     },
 }
 
@@ -1986,6 +2235,8 @@ class QQOfficialFullPlatformAdapter(Platform):
         self.appid = str(platform_config.get("appid") or "")
         self.secret = str(platform_config.get("secret") or "")
         self.use_markdown = bool(platform_config.get("use_markdown", True))
+        self.enable_streaming = bool(platform_config.get("enable_streaming", True))
+        self.enable_c2c_typing = bool(platform_config.get("enable_c2c_typing", True))
         self.intents = self._resolve_intents(platform_config)
         self.gateway_url_override = str(platform_config.get("gateway_url") or "")
         self.client = QQOfficialClient(
@@ -1996,6 +2247,8 @@ class QQOfficialFullPlatformAdapter(Platform):
             chunked_upload_threshold=int(
                 platform_config.get("chunked_upload_threshold") or 20 * 1024 * 1024
             ),
+            url_direct_upload=bool(platform_config.get("url_direct_upload", True)),
+            user_agent_suffix=str(platform_config.get("user_agent_suffix") or ""),
         )
         self._sessions: dict[str, dict[str, Any]] = {}
         self._reply_limiter = ReplyLimiter()
@@ -2027,7 +2280,11 @@ class QQOfficialFullPlatformAdapter(Platform):
         )
         if configured:
             return Path(str(configured))
-        return Path("data") / "plugin_data" / "qqofficial_full_sessions.json"
+        return (
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / "qqofficial_full_sessions.json"
+        )
 
     def _load_sessions(self) -> None:
         """Load remembered QQ session metadata from disk."""
@@ -2065,7 +2322,13 @@ class QQOfficialFullPlatformAdapter(Platform):
         """
         raw_mask = str(platform_config.get("intent_mask") or "").strip()
         if raw_mask:
-            return int(raw_mask, 0)
+            try:
+                return int(raw_mask, 0)
+            except ValueError:
+                logger.warning(
+                    "[QQOfficialFull] Invalid intent_mask %r, falling back to intents list",
+                    raw_mask,
+                )
         mask = 0
         for item in platform_config.get("intents") or []:
             mask |= INTENT_ALIASES.get(str(item), 0)
@@ -2190,7 +2453,7 @@ class QQOfficialFullPlatformAdapter(Platform):
             return
 
         passive_degraded = False
-        passive_msg_id = reply_id or reply_message_id
+        passive_msg_id = reply_message_id or reply_id
         if from_event and scene in {"group", "c2c"} and passive_msg_id:
             allowed, _remaining, reason = self._reply_limiter.check_limit(
                 passive_msg_id
@@ -2284,11 +2547,12 @@ class QQOfficialFullPlatformAdapter(Platform):
         if media:
             payload.update(
                 {
-                    "content": text or None,
                     "msg_type": 7,
                     "media": {"file_info": media.get("file_info")},
                 }
             )
+            if text:
+                payload["content"] = text
         elif scene in {"channel", "dm"}:
             payload.setdefault("content", text)
         elif use_markdown:
@@ -2397,8 +2661,9 @@ class QQOfficialFullPlatformAdapter(Platform):
             if isinstance(component, Plain):
                 text_parts.append(component.text)
             elif isinstance(component, At):
-                if str(component.qq) == "all" or isinstance(component, AtAll):
-                    text_parts.append("@all ")
+                if isinstance(component, AtAll) or str(component.qq) == "all":
+                    # QQ Bot API has no @all capability; drop it silently.
+                    logger.debug("[QQOfficialFull] @all is unsupported, skipped")
                 else:
                     text_parts.append(f"<@{component.qq}> ")
             elif isinstance(component, Reply):
@@ -2703,11 +2968,7 @@ class QQOfficialFullPlatformAdapter(Platform):
                 for item in payload.get("mentions") or []
                 if item.get("is_you") and item.get("id")
             ]
-            for mention in bot_mentions:
-                mention_id = str(mention["id"])
-                content = content.replace(f"<@!{mention_id}>", "").replace(
-                    f"<@{mention_id}>", ""
-                )
+            content = _strip_mention_text(content, payload.get("mentions") or [])
             if bot_mentions:
                 components.append(
                     At(
@@ -2924,7 +3185,16 @@ class QQOfficialFullPlatformAdapter(Platform):
                 ".amr",
                 ".silk",
             }:
-                components.append(Record(file=url, url=url))
+                # Prefer QQ's ready-made WAV link (skips SILK->WAV conversion);
+                # carry the platform's built-in ASR text when available.
+                wav_url = _normalize_url(
+                    cast(str | None, _attr(attachment, "voice_wav_url", None))
+                )
+                record_url = wav_url or url
+                asr_text = str(_attr(attachment, "asr_refer_text", "") or "").strip()
+                components.append(
+                    Record(file=record_url, url=record_url, text=asr_text or None)
+                )
             elif content_type.startswith("video") or ext in {
                 ".mp4",
                 ".mov",
@@ -2958,7 +3228,11 @@ class QQOfficialFullPlatformAdapter(Platform):
                 self.commit_event(self.create_event(abm))
             return
         abm = await self._parse_message_event(event_type, payload, event_id)
-        if event_type == "C2C_MESSAGE_CREATE":
+        if (
+            event_type == "C2C_MESSAGE_CREATE"
+            and self.enable_c2c_typing
+            and abm.session_id
+        ):
             task = asyncio.create_task(self._send_c2c_input_notify(abm.session_id))
             self._typing_tasks.add(task)
             task.add_done_callback(self._typing_tasks.discard)
@@ -3118,57 +3392,90 @@ class QQOfficialFullPlatformAdapter(Platform):
         """Run one QQ gateway WebSocket connection."""
         gateway_url = self.gateway_url_override or await self.client.get_gateway()
         token = await self.client.get_access_token()
-        async with websockets.connect(gateway_url) as websocket:
-            async for raw_message in websocket:
-                payload = json.loads(raw_message)
-                op = payload.get("op")
-                if payload.get("s") is not None:
-                    self._last_seq = int(payload["s"])
-                if op == OP_HELLO:
-                    interval = int(
-                        payload.get("d", {}).get("heartbeat_interval") or 45000
-                    )
-                    await self._send_gateway_auth(websocket, token)
-                    if self._heartbeat_task:
-                        self._heartbeat_task.cancel()
-                    self._heartbeat_task = asyncio.create_task(
-                        self._gateway_heartbeat(websocket, interval)
-                    )
-                elif op == OP_DISPATCH:
-                    event_type = str(payload.get("t") or "")
-                    data = payload.get("d") or {}
-                    if event_type == "READY":
-                        self._session_id = str(data.get("session_id") or "")
-                    elif event_type == "RESUMED":
-                        logger.info("[QQOfficialFull] Gateway session resumed.")
-                    elif event_type:
-                        await self._dispatch_payload_event(
-                            event_type, data, payload.get("id")
+        try:
+            async with websockets.connect(
+                gateway_url, max_size=10 * 1024 * 1024
+            ) as websocket:
+                async for raw_message in websocket:
+                    payload = json.loads(raw_message)
+                    op = payload.get("op")
+                    if payload.get("s") is not None:
+                        self._last_seq = int(payload["s"])
+                    if op == OP_HELLO:
+                        interval = int(
+                            payload.get("d", {}).get("heartbeat_interval") or 45000
                         )
-                elif op == OP_RECONNECT:
-                    raise QQGatewayClosed(
-                        GATEWAY_CLOSE_SESSION_TIMEOUT, "server reconnect"
-                    )
-                elif op == OP_INVALID_SESSION:
-                    self._session_id = None
-                    self._last_seq = None
-                    raise QQGatewayClosed(
-                        GATEWAY_CLOSE_INVALID_SESSION, "invalid session"
-                    )
+                        await self._send_gateway_auth(websocket, token)
+                        if self._heartbeat_task:
+                            self._heartbeat_task.cancel()
+                        self._heartbeat_task = asyncio.create_task(
+                            self._gateway_heartbeat(websocket, interval)
+                        )
+                    elif op == OP_DISPATCH:
+                        event_type = str(payload.get("t") or "")
+                        data = payload.get("d") or {}
+                        if event_type == "READY":
+                            self._session_id = str(data.get("session_id") or "")
+                        elif event_type == "RESUMED":
+                            logger.info("[QQOfficialFull] Gateway session resumed.")
+                        elif event_type:
+                            try:
+                                await self._dispatch_payload_event(
+                                    event_type, data, payload.get("id")
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "[QQOfficialFull] Gateway event dispatch "
+                                    "failed for %s",
+                                    event_type,
+                                )
+                    elif op == OP_RECONNECT:
+                        logger.info("[QQOfficialFull] Gateway requested reconnect.")
+                        return
+                    elif op == OP_INVALID_SESSION:
+                        if payload.get("d"):
+                            logger.warning(
+                                "[QQOfficialFull] Session invalidated but "
+                                "resumable; reconnecting with resume."
+                            )
+                        else:
+                            logger.warning(
+                                "[QQOfficialFull] Session invalidated; "
+                                "re-identifying with a fresh token."
+                            )
+                            self._session_id = None
+                            self._last_seq = None
+                            self.client.clear_token()
+                        return
+        finally:
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                self._heartbeat_task = None
 
     async def run(self) -> None:
         """Run the QQ WebSocket gateway loop."""
         reconnect_delay = 1.0
         while not self._shutdown_event.is_set():
+            started_at = time.monotonic()
             try:
                 await self._gateway_once()
-                reconnect_delay = 1.0
             except asyncio.CancelledError:
                 raise
             except websockets.exceptions.ConnectionClosed as exc:
-                reconnect_delay = self._handle_gateway_close(
-                    QQGatewayClosed(exc.code, exc.reason), reconnect_delay
-                )
+                try:
+                    reconnect_delay = self._handle_gateway_close(
+                        QQGatewayClosed(exc.code, exc.reason), reconnect_delay
+                    )
+                except QQGatewayClosed as fatal:
+                    logger.error(
+                        "[QQOfficialFull] Gateway closed fatally (%s %s): "
+                        "intents not allowed, stop reconnecting. Please fix "
+                        "bot intents/permissions then restart.",
+                        fatal.code,
+                        fatal.reason,
+                    )
+                    await self._shutdown_event.wait()
+                    return
                 logger.warning(
                     "[QQOfficialFull] Gateway closed: %s, reconnecting in %.1fs",
                     exc,
@@ -3176,6 +3483,7 @@ class QQOfficialFullPlatformAdapter(Platform):
                 )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60.0)
+                continue
             except Exception as exc:
                 logger.warning(
                     "[QQOfficialFull] Gateway error: %s, reconnecting in %.1fs",
@@ -3184,6 +3492,18 @@ class QQOfficialFullPlatformAdapter(Platform):
                 )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60.0)
+                continue
+            # Clean return (server asked to reconnect / connection closed
+            # without an exception). Guard against quick-disconnect loops.
+            if time.monotonic() - started_at < 5.0:
+                logger.warning(
+                    "[QQOfficialFull] Gateway disconnected quickly, "
+                    "waiting %.1fs before reconnect",
+                    GATEWAY_RATE_LIMIT_DELAY,
+                )
+                await asyncio.sleep(GATEWAY_RATE_LIMIT_DELAY)
+            else:
+                reconnect_delay = 1.0
 
     async def terminate(self) -> None:
         """Terminate gateway and HTTP resources."""
@@ -3201,9 +3521,7 @@ class QQOfficialFullPlatformAdapter(Platform):
     support_streaming_message=True,
     config_metadata={
         **CONFIG_METADATA,
-        "unified_webhook_mode": {"type": "bool", "default": True},
-        "webhook_uuid": {"type": "string", "default": ""},
-        "verify_webhook_signature": {"type": "bool", "default": True},
+        **WEBHOOK_CONFIG_METADATA,
     },
 )
 class QQOfficialFullWebhookPlatformAdapter(QQOfficialFullPlatformAdapter):

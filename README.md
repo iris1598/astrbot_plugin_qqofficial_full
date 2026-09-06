@@ -4,7 +4,7 @@
 
 支持 **WebSocket Gateway** 与 **HTTP Webhook** 两种事件接收方式，覆盖群聊、频道、私聊三大场景，实现丰富媒体类型的收发、流式输出、大文件分片上传等能力。
 
-> 插件版本：v0.4.0 | 作者：OpenCode
+> 插件版本：v0.4.1 | 作者：OpenCode
 
 ---
 
@@ -107,6 +107,10 @@
 | `gateway_url` | string | `""` | WebSocket 网关 URL 覆盖（默认 `wss://api.sgroup.qq.com/websocket`） |
 | `chunked_upload_threshold` | int | `20971520` | 分片上传阈值，单位字节（默认 20MB） |
 | `session_store_path` | string | `""` | 会话持久化路径覆盖 |
+| `url_direct_upload` | bool | `true` | 公网 URL 直传 QQ 平台自行拉取；关闭时插件先下载再 Base64 上传（对齐 openclaw `urlDirectUpload`） |
+| `enable_streaming` | bool | `true` | 启用 C2C 流式回复；关闭时流式内容缓冲后整条发送（对齐 openclaw `streaming`） |
+| `enable_c2c_typing` | bool | `true` | 收到私聊消息时自动发送「正在输入」状态 |
+| `user_agent_suffix` | string | `""` | 追加在 HTTP User-Agent 尾部的标识（对齐 openclaw `userAgentSuffix`） |
 
 **Intent 别名说明：**
 

@@ -134,6 +134,29 @@ WEBHOOK_RATE_MAX_REQUESTS = 600
 WEBHOOK_RATE_MAX_KEYS = 4096
 
 
+def _register_unique_session_builders() -> None:
+    """Register unique session ID builders in AstrBot's waking_check stage."""
+    try:
+        from astrbot.core.pipeline.waking_check.stage import UNIQUE_SESSION_ID_BUILDERS
+
+        def _builder(event: Any) -> str | None:
+            sender_id = event.get_sender_id()
+            if not sender_id:
+                return None
+            group_id = event.get_group_id()
+            if group_id:
+                return f"{sender_id}_{group_id}"
+            return str(sender_id)
+
+        UNIQUE_SESSION_ID_BUILDERS["qq_official_full"] = _builder
+        UNIQUE_SESSION_ID_BUILDERS["qq_official_full_webhook"] = _builder
+    except Exception as exc:
+        logger.debug("[QQOfficialFull] Failed to register unique session builders: %s", exc)
+
+
+_register_unique_session_builders()
+
+
 class QQOfficialAPIError(Exception):
     """Error raised for QQ Open Platform API failures.
 
@@ -2166,11 +2189,21 @@ class QQOfficialFullMessageEvent(AstrMessageEvent):
         Args:
             message: AstrBot message chain.
         """
+        scene = self.get_extra("qq_scene") or (
+            "group" if self.message_obj.type == MessageType.GROUP_MESSAGE else "c2c"
+        )
+        target_id = (
+            self.message_obj.group_id
+            if (scene in {"group", "channel"} or self.message_obj.type == MessageType.GROUP_MESSAGE)
+            else (self.get_sender_id() or str(self.get_extra("guild_id") or "") or self.session_id)
+        )
         await self.adapter._send_to_session(
             self.session,
             message,
             reply_message_id=self.message_obj.message_id,
             from_event=True,
+            scene=scene,
+            target_id=target_id,
         )
         await super().send(message)
 
@@ -2181,8 +2214,9 @@ class QQOfficialFullMessageEvent(AstrMessageEvent):
         )
         if scene != "c2c":
             return
+        target_openid = self.get_sender_id() or self.session_id
         await self.adapter._send_c2c_input_notify(
-            self.session_id, self.message_obj.message_id
+            target_openid, self.message_obj.message_id
         )
 
     async def send_streaming(
@@ -2208,9 +2242,10 @@ class QQOfficialFullMessageEvent(AstrMessageEvent):
                 await self.send(buffer)
             return
 
+        target_openid = self.get_sender_id() or self.session_id
         controller = QQStreamingController(
             self.adapter.client,
-            self.session_id,
+            target_openid,
             self.message_obj.message_id,
             on_completed=lambda ret, content: self.adapter._store_ref_index(
                 ret, content, "c2c"
@@ -2594,7 +2629,7 @@ class QQOfficialFullPlatformAdapter(Platform):
             QQ Official full message event.
         """
         event = QQOfficialFullMessageEvent(
-            message.message_str,
+            getattr(message, "message_str", "") or "",
             message,
             self.meta(),
             message.session_id,
@@ -2617,6 +2652,76 @@ class QQOfficialFullPlatformAdapter(Platform):
         await self._send_to_session(session, message_chain, from_event=False)
         await Platform.send_by_session(self, session, message_chain)
 
+    def _resolve_session_target(
+        self,
+        session: MessageSesion,
+        explicit_scene: str | None = None,
+        explicit_target_id: str | None = None,
+    ) -> tuple[str, str, dict]:
+        """Resolve QQ scene and physical target ID from an AstrBot session.
+
+        Handles:
+        1. Explicit scene and target_id (e.g. from event reply).
+        2. Direct match in self._sessions.
+        3. Match against known target keys in self._sessions as suffix of composite session_id.
+        4. Composite session_id ({sender_id}_{group_id} or {sender_id}%{group_id}).
+        5. Fallback inference based on message_type and session_id.
+
+        Returns:
+            (scene, target_id, session_info)
+        """
+        sid = str(session.session_id or "")
+        session_info = dict(self._sessions.get(sid, {}))
+
+        scene = explicit_scene or session_info.get("scene")
+        target_id = explicit_target_id or session_info.get("target_id")
+
+        if not target_id:
+            for known_key, target_info in self._sessions.items():
+                if known_key and (sid.endswith(f"_{known_key}") or sid.endswith(f"%{known_key}")):
+                    session_info = {**target_info, **session_info}
+                    scene = scene or target_info.get("scene")
+                    target_id = str(target_info.get("target_id") or known_key)
+                    break
+
+        if not target_id and ("_" in sid or "%" in sid):
+            separator = "_" if "_" in sid else "%"
+            parts = sid.split(separator, 1)
+            potential_target = parts[1].strip() if len(parts) > 1 else ""
+            if potential_target:
+                target_info = self._sessions.get(potential_target, {})
+                if target_info:
+                    session_info = {**target_info, **session_info}
+                    scene = scene or target_info.get("scene")
+                    target_id = str(target_info.get("target_id") or potential_target)
+                elif session.message_type == MessageType.GROUP_MESSAGE:
+                    target_id = potential_target
+            if not target_id:
+                rparts = sid.rsplit(separator, 1)
+                rtarget = rparts[1].strip() if len(rparts) > 1 else ""
+                if rtarget:
+                    target_info = self._sessions.get(rtarget, {})
+                    if target_info:
+                        session_info = {**target_info, **session_info}
+                        scene = scene or target_info.get("scene")
+                        target_id = str(target_info.get("target_id") or rtarget)
+                    elif session.message_type == MessageType.GROUP_MESSAGE:
+                        target_id = rtarget
+
+        if not scene:
+            if session.message_type == MessageType.GROUP_MESSAGE:
+                if target_id and self._sessions.get(target_id, {}).get("scene") == "channel":
+                    scene = "channel"
+                else:
+                    scene = "group"
+            else:
+                scene = "c2c"
+
+        if not target_id:
+            target_id = str(session_info.get("target_id") or sid)
+
+        return scene, target_id, session_info
+
     async def _send_to_session(
         self,
         session: MessageSesion,
@@ -2624,6 +2729,8 @@ class QQOfficialFullPlatformAdapter(Platform):
         *,
         reply_message_id: str | None = None,
         from_event: bool = False,
+        scene: str | None = None,
+        target_id: str | None = None,
     ) -> None:
         """Send a message chain to a remembered QQ session.
 
@@ -2632,6 +2739,8 @@ class QQOfficialFullPlatformAdapter(Platform):
             message_chain: AstrBot message chain.
             reply_message_id: Current event message id for reply sends.
             from_event: Whether this is an event reply instead of proactive send.
+            scene: Optional explicit QQ scene.
+            target_id: Optional explicit QQ target id.
         """
         chunks = []
         for media_chunk in self._split_chain_by_media(message_chain):
@@ -2642,6 +2751,8 @@ class QQOfficialFullPlatformAdapter(Platform):
                 chunk,
                 reply_message_id=reply_message_id,
                 from_event=from_event,
+                scene=scene,
+                target_id=target_id,
             )
 
     async def _send_one_chunk(
@@ -2651,6 +2762,8 @@ class QQOfficialFullPlatformAdapter(Platform):
         *,
         reply_message_id: str | None,
         from_event: bool,
+        scene: str | None = None,
+        target_id: str | None = None,
     ) -> None:
         """Send one media-compatible QQ message chunk.
 
@@ -2659,12 +2772,12 @@ class QQOfficialFullPlatformAdapter(Platform):
             message_chain: Chunked message chain.
             reply_message_id: Current event message id for reply sends.
             from_event: Whether this is an event reply.
+            scene: Optional explicit QQ scene.
+            target_id: Optional explicit QQ target id.
         """
-        session_info = self._sessions.get(session.session_id, {})
-        scene = session_info.get("scene") or (
-            "group" if session.message_type == MessageType.GROUP_MESSAGE else "c2c"
+        scene, target_id, session_info = self._resolve_session_target(
+            session, explicit_scene=scene, explicit_target_id=target_id
         )
-        target_id = str(session_info.get("target_id") or session.session_id)
         text, media, reply_id, keyboard, raw_payload = await self._parse_chain(
             message_chain,
             session,
@@ -2727,6 +2840,13 @@ class QQOfficialFullPlatformAdapter(Platform):
                 target_id=target_id,
                 message_id=sent_id,
             )
+            if target_id and target_id != session.session_id:
+                self.remember_session(
+                    target_id,
+                    scene=scene,
+                    target_id=target_id,
+                    message_id=sent_id,
+                )
         self._store_ref_index(
             ret,
             text or self._media_label_for_chain(message_chain),
@@ -3042,6 +3162,7 @@ class QQOfficialFullPlatformAdapter(Platform):
         scene: str,
         target_id: str | None = None,
         message_id: str | None = None,
+        save: bool = True,
         **extra: Any,
     ) -> None:
         """Remember QQ scene metadata for proactive sends.
@@ -3051,17 +3172,29 @@ class QQOfficialFullPlatformAdapter(Platform):
             scene: QQ scene name.
             target_id: QQ API target id.
             message_id: Last QQ message id.
+            save: Whether to persist to disk.
             **extra: Additional session metadata.
         """
         if not session_id:
             return
         item = self._sessions.setdefault(session_id, {})
-        item["scene"] = scene
-        item["target_id"] = target_id or session_id
-        if message_id:
+        changed = False
+        if item.get("scene") != scene:
+            item["scene"] = scene
+            changed = True
+        resolved_target = str(target_id or session_id)
+        if item.get("target_id") != resolved_target:
+            item["target_id"] = resolved_target
+            changed = True
+        if message_id and item.get("message_id") != message_id:
             item["message_id"] = message_id
-        item.update(extra)
-        self._save_sessions()
+            changed = True
+        for k, v in extra.items():
+            if item.get(k) != v:
+                item[k] = v
+                changed = True
+        if save and changed:
+            self._save_sessions()
 
     def remember_session_message_id(self, session_id: str, message_id: str) -> None:
         """Remember the last QQ message id for a session.
@@ -3098,7 +3231,30 @@ class QQOfficialFullPlatformAdapter(Platform):
         Returns:
             QQ scene name or None.
         """
-        return cast(str | None, self._sessions.get(session_id, {}).get("scene"))
+        if not session_id:
+            return None
+        info = self._sessions.get(session_id)
+        if info and info.get("scene"):
+            return str(info["scene"])
+        for known_key, target_info in self._sessions.items():
+            if known_key and (session_id.endswith(f"_{known_key}") or session_id.endswith(f"%{known_key}")):
+                if target_info and target_info.get("scene"):
+                    return str(target_info["scene"])
+        if "_" in session_id or "%" in session_id:
+            separator = "_" if "_" in session_id else "%"
+            parts = session_id.split(separator, 1)
+            target = parts[1].strip() if len(parts) > 1 else ""
+            if target:
+                target_info = self._sessions.get(target)
+                if target_info and target_info.get("scene"):
+                    return str(target_info["scene"])
+            rparts = session_id.rsplit(separator, 1)
+            rtarget = rparts[1].strip() if len(rparts) > 1 else ""
+            if rtarget:
+                target_info = self._sessions.get(rtarget)
+                if target_info and target_info.get("scene"):
+                    return str(target_info["scene"])
+        return None
 
     def _store_ref_index(
         self, ret: Any, content: str, scope: str, *, is_bot: bool = True
@@ -3228,6 +3384,19 @@ class QQOfficialFullPlatformAdapter(Platform):
                 target_id=group_id,
                 message_id=abm.message_id,
             )
+            if sender_id:
+                self.remember_session(
+                    sender_id,
+                    scene="group",
+                    target_id=group_id,
+                    message_id=abm.message_id,
+                )
+                self.remember_session(
+                    f"{sender_id}_{group_id}",
+                    scene="group",
+                    target_id=group_id,
+                    message_id=abm.message_id,
+                )
             self._msg_id_cache.cache("group", group_id, abm.message_id)
         elif event_type == "C2C_MESSAGE_CREATE":
             author = payload.get("author") or {}
@@ -3260,8 +3429,9 @@ class QQOfficialFullPlatformAdapter(Platform):
             abm.type = MessageType.GROUP_MESSAGE
             abm.group_id = channel_id
             abm.session_id = channel_id
+            author_id = str(author.get("id") or "")
             abm.sender = MessageMember(
-                str(author.get("id") or ""), author.get("username") or ""
+                author_id, author.get("username") or ""
             )
             abm.self_id = bot_id
             qq_scene = "channel"
@@ -3271,6 +3441,19 @@ class QQOfficialFullPlatformAdapter(Platform):
                 target_id=channel_id,
                 message_id=abm.message_id,
             )
+            if author_id:
+                self.remember_session(
+                    author_id,
+                    scene="channel",
+                    target_id=channel_id,
+                    message_id=abm.message_id,
+                )
+                self.remember_session(
+                    f"{author_id}_{channel_id}",
+                    scene="channel",
+                    target_id=channel_id,
+                    message_id=abm.message_id,
+                )
         elif event_type == "DIRECT_MESSAGE_CREATE":
             author = payload.get("author") or {}
             sender_id = str(author.get("id") or author.get("user_openid") or "")
@@ -3286,6 +3469,13 @@ class QQOfficialFullPlatformAdapter(Platform):
                 target_id=guild_id,
                 message_id=abm.message_id,
             )
+            if sender_id and sender_id != abm.session_id:
+                self.remember_session(
+                    sender_id,
+                    scene="dm",
+                    target_id=guild_id,
+                    message_id=abm.message_id,
+                )
         else:
             author = payload.get("author") or {}
             sender_id = str(author.get("user_openid") or author.get("id") or "")
@@ -3556,14 +3746,21 @@ class QQOfficialFullPlatformAdapter(Platform):
             abm.type = MessageType.GROUP_MESSAGE
             abm.group_id = group_id
             abm.session_id = group_id
+            qq_scene = "group"
+            self.remember_session(group_id, scene="group", target_id=group_id)
+            if operator_id:
+                self.remember_session(operator_id, scene="group", target_id=group_id)
+                self.remember_session(f"{operator_id}_{group_id}", scene="group", target_id=group_id)
         elif operator_id:
             abm.type = MessageType.FRIEND_MESSAGE
             abm.session_id = operator_id
+            qq_scene = "c2c"
+            self.remember_session(operator_id, scene="c2c", target_id=operator_id)
         else:
             return None
         abm.sender = MessageMember(operator_id, "")
         self._pending_event_extras[abm.message_id] = {
-            "qq_scene": self.session_scene(abm.session_id) or "unknown",
+            "qq_scene": qq_scene,
             "event_id": event_id,
             "raw_event_type": "INTERACTION_CREATE",
             "qq_interaction": payload,

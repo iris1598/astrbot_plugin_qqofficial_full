@@ -9,7 +9,9 @@ class QQOfficialFullPlugin(Star):
         from .qqofficial_adapter import (  # noqa: F401
             QQOfficialFullPlatformAdapter,
             QQOfficialFullWebhookPlatformAdapter,
+            _register_unique_session_builders,
         )
         from .tools import QQBotPlatformApiTool
 
+        _register_unique_session_builders()
         context.add_llm_tools(QQBotPlatformApiTool())

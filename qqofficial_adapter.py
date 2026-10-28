@@ -135,23 +135,42 @@ WEBHOOK_RATE_MAX_KEYS = 4096
 
 
 def _register_unique_session_builders() -> None:
-    """Register unique session ID builders in AstrBot's waking_check stage."""
+    """Register unique session ID builders for AstrBot session isolation.
+
+    AstrBot >= 4.29 applies isolation in ``EventBus.dispatch`` and hosts
+    ``UNIQUE_SESSION_ID_BUILDERS`` in ``astrbot.core.event_bus``; older
+    versions kept it in ``astrbot.core.pipeline.waking_check.stage``.
+    """
     try:
-        from astrbot.core.pipeline.waking_check.stage import UNIQUE_SESSION_ID_BUILDERS
-
-        def _builder(event: Any) -> str | None:
-            sender_id = event.get_sender_id()
-            if not sender_id:
-                return None
-            group_id = event.get_group_id()
-            if group_id:
-                return f"{sender_id}_{group_id}"
-            return str(sender_id)
-
-        UNIQUE_SESSION_ID_BUILDERS["qq_official_full"] = _builder
-        UNIQUE_SESSION_ID_BUILDERS["qq_official_full_webhook"] = _builder
+        from astrbot.core.event_bus import UNIQUE_SESSION_ID_BUILDERS
+    except ImportError:
+        try:
+            from astrbot.core.pipeline.waking_check.stage import (  # type: ignore[no-redef]
+                UNIQUE_SESSION_ID_BUILDERS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[QQOfficialFull] Failed to locate UNIQUE_SESSION_ID_BUILDERS: %s",
+                exc,
+            )
+            return
     except Exception as exc:
-        logger.debug("[QQOfficialFull] Failed to register unique session builders: %s", exc)
+        logger.warning(
+            "[QQOfficialFull] Failed to import astrbot.core.event_bus: %s", exc
+        )
+        return
+
+    def _builder(event: Any) -> str | None:
+        sender_id = event.get_sender_id()
+        if not sender_id:
+            return None
+        group_id = event.get_group_id()
+        if group_id:
+            return f"{sender_id}_{group_id}"
+        return str(sender_id)
+
+    UNIQUE_SESSION_ID_BUILDERS["qq_official_full"] = _builder
+    UNIQUE_SESSION_ID_BUILDERS["qq_official_full_webhook"] = _builder
 
 
 _register_unique_session_builders()
